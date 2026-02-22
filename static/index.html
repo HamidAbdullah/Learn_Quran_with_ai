@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quran AI Recitation - Premium Demo</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=Amiri:wght@400;700&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --primary: #00d2ff;
+            --secondary: #3a7bd5;
+            --bg: #0f172a;
+            --card-bg: rgba(255, 255, 255, 0.05);
+            --text: #f8fafc;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Outfit', sans-serif;
+            background: radial-gradient(circle at top right, #1e293b, #0f172a);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            width: 90%;
+            max-width: 1000px;
+            margin-top: 50px;
+            padding-bottom: 100px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .glass-card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+
+        .inputs {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+
+        input {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            padding: 12px 20px;
+            color: white;
+            font-size: 1rem;
+            width: 120px;
+            transition: all 0.3s ease;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: var(--primary);
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .controls {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .record-btn {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            border: none;
+            background: linear-gradient(135deg, #ff416c, #ff4b2b);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 0 20px rgba(255, 75, 43, 0.4);
+            transition: all 0.3s ease;
+        }
+
+        .record-btn.recording {
+            animation: pulse 1.5s infinite;
+            background: #ef4444;
+        }
+
+        @keyframes pulse {
+            0% {
+                transform: scale(1);
+                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+            }
+
+            70% {
+                transform: scale(1.1);
+                box-shadow: 0 0 0 20px rgba(239, 68, 68, 0);
+            }
+
+            100% {
+                transform: scale(1);
+                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+            }
+        }
+
+        .btn {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border: none;
+            border-radius: 12px;
+            padding: 12px 30px;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 210, 255, 0.4);
+        }
+
+        .results {
+            display: none;
+        }
+
+        .quran-text {
+            font-family: 'Amiri', serif;
+            font-size: 2.2rem;
+            text-align: right;
+            direction: rtl;
+            line-height: 2;
+            margin-bottom: 20px;
+        }
+
+        .word {
+            display: inline-block;
+            margin-left: 10px;
+            padding: 0 5px;
+            border-radius: 8px;
+            transition: background 0.3s;
+        }
+
+        .word.correct {
+            color: #4ade80;
+        }
+
+        .word.minor_mistake {
+            color: #facc15;
+        }
+
+        .word.wrong {
+            color: #f87171;
+        }
+
+        .word.missing {
+            color: #94a3b8;
+            text-decoration: line-through;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+            margin-top: 30px;
+        }
+
+        .stat-box {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 16px;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .stat-val {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--primary);
+        }
+
+        .stat-label {
+            font-size: 0.9rem;
+            color: #94a3b8;
+            margin-top: 5px;
+        }
+
+        .teacher-feedback {
+            margin-top: 30px;
+        }
+
+        .feedback-item {
+            background: rgba(255, 255, 255, 0.05);
+            border-left: 4px solid var(--primary);
+            padding: 15px;
+            border-radius: 0 12px 12px 0;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .feedback-icon {
+            font-size: 1.5rem;
+        }
+
+        .debug-console {
+            background: rgba(0, 0, 0, 0.5);
+            color: #4ade80;
+            font-family: monospace;
+            font-size: 0.8rem;
+            padding: 15px;
+            border-radius: 12px;
+            margin-top: 30px;
+            height: 150px;
+            overflow-y: auto;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        /* Real-time streaming styles */
+        .live-feedback {
+            font-size: 1.2rem;
+            color: var(--primary);
+            margin-top: 10px;
+            font-style: italic;
+            min-height: 1.5em;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(0, 210, 255, 0.1);
+            border-left-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(15, 23, 42, 0.9);
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <header>
+            <h1>Quran Recitation AI</h1>
+            <p>Intelligent Production Demo with Tajweed Analysis</p>
+        </header>
+
+        <div class="glass-card">
+            <div class="inputs">
+                <div>
+                    <label style="display:block; margin-bottom:5px; font-size:0.8rem; color:#94a3b8">Surah</label>
+                    <input type="number" id="surah" value="108" min="1" max="114">
+                </div>
+                <div>
+                    <label style="display:block; margin-bottom:5px; font-size:0.8rem; color:#94a3b8">Ayah</label>
+                    <input type="number" id="ayah" value="1">
+                </div>
+            </div>
+
+            <div class="controls">
+                <button id="recordBtn" class="record-btn">
+                    <svg width="30" height="30" viewBox="0 0 24 24" fill="white">
+                        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                        <path
+                            d="M17 11c0 2.76-2.24-5-5-5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+                    </svg>
+                </button>
+                <p id="status" style="color:#94a3b8">Press to record recitation</p>
+                <div id="liveFeedback" class="live-feedback"></div>
+            </div>
+        </div>
+
+        <div id="results" class="results">
+            <div class="glass-card">
+                <div id="transcribedText" class="quran-text"></div>
+
+                <div class="stats">
+                    <div class="stat-box">
+                        <div id="accuracyScore" class="stat-val">0%</div>
+                        <div class="stat-label">Pronunciation Accuracy</div>
+                    </div>
+                    <div class="stat-box">
+                        <div id="tajweedScore" class="stat-val">0%</div>
+                        <div class="stat-label">Tajweed Score</div>
+                    </div>
+                </div>
+
+                <div class="teacher-feedback">
+                    <h3>💡 Teacher Wisdom</h3>
+                    <div id="feedbackList"></div>
+                </div>
+            </div>
+
+            <div class="debug-console" id="debugConsole">
+                <div>🚀 System ready. Waiting for user...</div>
+            </div>
+        </div>
+    </div>
+
+    <div id="loading" class="loading-overlay">
+        <div class="spinner"></div>
+        <p style="margin-top: 20px;">Analyzing Recitation...</p>
+    </div>
+
+    <script>
+        const debugConsole = document.getElementById('debugConsole');
+        function logDebug(msg, type = 'info') {
+            const div = document.createElement('div');
+            div.style.color = type === 'error' ? '#f87171' : (type === 'warn' ? '#facc15' : '#4ade80');
+            div.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            debugConsole.appendChild(div);
+            debugConsole.scrollTop = debugConsole.scrollHeight;
+            console.log(msg);
+        }
+
+        // --- PROTOCOL PROTECTION ---
+        if (window.location.protocol === 'file:') {
+            logDebug("⛔ ERROR: You are opening this file directly.", 'error');
+            logDebug("Please use the server URL: http://localhost:8000/demo/", 'warn');
+            alert("CRITICAL: You MUST access this demo through http://localhost:8000/demo/ - Direct file access is blocked by browser security (CORS).");
+        }
+
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let stream; // Declare stream globally or pass it
+
+        const recordBtn = document.getElementById('recordBtn');
+        const statusText = document.getElementById('status');
+        const resultsDiv = document.getElementById('results');
+        const loading = document.getElementById('loading');
+        const liveFeedbackDiv = document.getElementById('liveFeedback');
+
+        let ws;
+        let reconnectTimeout;
+        let reconnectAttempts = 0;
+
+        async function connectWebSocket(surah, ayah) {
+            if (ws) ws.close();
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const socketUrl = `${protocol}//${window.location.host}/ws/verify?surah=${surah}&ayah=${ayah}`;
+
+            logDebug(`Connecting to WebSocket: ${socketUrl}`);
+            ws = new WebSocket(socketUrl);
+
+            ws.onopen = () => {
+                logDebug("WebSocket Connected ✅");
+                reconnectAttempts = 0;
+                clearTimeout(reconnectTimeout);
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'partial_result') {
+                        liveFeedbackDiv.innerText = `Recognized: ${data.transcribed}`;
+                        logDebug(`Live: ${data.transcribed}`);
+                    }
+                } catch (e) {
+                    logDebug(`WS Message Error: ${e.message}`, 'error');
+                }
+            };
+
+            ws.onerror = (err) => {
+                logDebug("WebSocket error detected. Check backend connection.", 'error');
+            };
+
+            ws.onclose = () => {
+                logDebug("WebSocket Closed");
+                if (isRecording && reconnectAttempts < 5) {
+                    logDebug(`Attempting reconnect in ${Math.pow(2, reconnectAttempts)}s...`, 'warn');
+                    reconnectTimeout = setTimeout(() => {
+                        reconnectAttempts++;
+                        connectWebSocket(surah, ayah);
+                    }, Math.pow(2, reconnectAttempts) * 1000);
+                }
+            };
+        }
+
+        recordBtn.onclick = async () => {
+            if (!isRecording) {
+                startRecording();
+            } else {
+                stopRecording();
+            }
+        };
+
+        async function startRecording() {
+            try {
+                const surah = document.getElementById('surah').value;
+                const ayah = document.getElementById('ayah').value;
+
+                await connectWebSocket(surah, ayah);
+
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                logDebug("Microphone access granted.");
+
+                const options = { mimeType: 'audio/webm;codecs=opus' };
+                if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                    delete options.mimeType;
+                }
+
+                mediaRecorder = new MediaRecorder(stream, options);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(event.data);
+                        }
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    logDebug("Processing final results...");
+                    if (ws) ws.close();
+                    const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+                    sendToAPI(audioBlob);
+                    recordBtn.disabled = false;
+                };
+
+                mediaRecorder.start(1000);
+                isRecording = true;
+                recordBtn.classList.add('recording');
+                statusText.innerText = 'Listening...';
+                resultsDiv.style.display = 'none';
+                liveFeedbackDiv.innerText = 'Listening live...';
+            } catch (err) {
+                logDebug(`Start Error: ${err.message}`, 'error');
+                alert(`Error: ${err.message}`);
+                recordBtn.disabled = false;
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                console.log("Stopping MediaRecorder.");
+                mediaRecorder.stop();
+            }
+            isRecording = false;
+            recordBtn.classList.remove('recording');
+            statusText.innerText = 'Finishing recording...';
+            recordBtn.disabled = true; // Disable until processed
+
+            // Stop all tracks in the stream
+            if (stream) {
+                stream.getTracks().forEach(track => {
+                    if (track.readyState === 'live') {
+                        track.stop();
+                        console.log("Track stopped:", track.kind);
+                    }
+                });
+            }
+        }
+
+        async function sendToAPI(blob) {
+            console.log("Sending audio to API, blob size:", blob.size, "type:", blob.type);
+            loading.style.display = 'flex';
+            statusText.innerText = 'Analyzing with Quran AI...';
+            liveFeedbackDiv.innerText = 'Analyzing...';
+
+            const surah = document.getElementById('surah').value;
+            const ayah = document.getElementById('ayah').value;
+
+            const formData = new FormData();
+            // Use a generic name but correct extension
+            const extension = blob.type.includes('webm') ? 'webm' : (blob.type.includes('ogg') ? 'ogg' : 'wav'); // Added wav fallback
+            formData.append('audio', blob, `recitation.${extension}`);
+
+            try {
+                const url = `/verify?surah=${surah}&ayah=${ayah}`;
+                console.log("Posting to:", url);
+                const response = await fetch(url, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                console.log("API response status:", response.status);
+                if (!response.ok) {
+                    const errorData = await response.json().catch(e => {
+                        console.error("Failed to parse error JSON:", e);
+                        return { detail: "Unknown error, failed to parse response." };
+                    });
+                    throw new Error(errorData.detail || `API Error: ${response.status} ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                console.log("API Response Data:", data);
+                displayResults(data);
+            } catch (error) {
+                console.error('API Error:', error);
+                statusText.innerText = `Error: ${error.message}`;
+                alert(`Error: ${error.message}\nCheck browser console for details.`);
+            } finally {
+                loading.style.display = 'none';
+                liveFeedbackDiv.innerText = ''; // Clear live feedback after analysis
+            }
+        }
+
+        function displayResults(data) {
+            resultsDiv.style.display = 'block';
+            resultsDiv.scrollIntoView({ behavior: 'smooth' });
+
+            const transcribedDiv = document.getElementById('transcribedText');
+            // Clear and build word-by-word
+            transcribedDiv.innerHTML = '';
+            data.word_analysis.forEach(item => {
+                const span = document.createElement('span');
+                span.innerText = item.word + ' ';
+                span.className = `word ${item.status}`;
+                span.title = `Confidence: ${Math.round(item.confidence * 100)}% - ${item.feedback}`;
+                transcribedDiv.appendChild(span);
+            });
+
+            document.getElementById('accuracyScore').innerText = `${data.accuracy_score}%`;
+            document.getElementById('tajweedScore').innerText = `${data.tajweed_score}%`;
+
+            // Confidence Level UI
+            const confDiv = document.getElementById('teacherFeedback') || transcribedDiv;
+            statusText.innerText = `Analysis Complete - Confidence: ${data.confidence_level.toUpperCase()}`;
+
+            const feedbackList = document.getElementById('feedbackList');
+            feedbackList.innerHTML = `<div style="font-style: italic; margin-bottom: 10px; color: #94a3b8;">${data.teacher_feedback_text}</div>`;
+
+            data.tajweed_feedback.forEach(item => {
+                const div = document.createElement('div');
+                div.className = 'feedback-item';
+                div.innerHTML = `
+                    <span class="feedback-icon">${item.score > 0.95 ? '⭐' : '📖'}</span>
+                    <span><strong>${item.rule}</strong>: ${item.feedback}</span>
+                `;
+                feedbackList.appendChild(div);
+            });
+        }
+    </script>
+
+</body>
+
+</html>

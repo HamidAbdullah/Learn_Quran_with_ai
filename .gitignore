@@ -1,0 +1,97 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+venv.bak/
+pyvenv.cfg
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints
+
+# =========================
+# FastAPI / Backend
+# =========================
+*.log
+logs/
+static/uploads/
+
+# =========================
+# AI / ML Models (IMPORTANT ⚠️)
+# Do NOT push models to git
+# =========================
+*.pt
+*.pth
+*.bin
+*.onnx
+*.h5
+*.ckpt
+models/
+checkpoints/
+
+# =========================
+# Dataset (VERY IMPORTANT FOR YOU)
+# You have Quran audio + dataset
+# Keep this out of git
+# =========================
+dataset/
+quran_full.json
+quran_with_audio.json
+
+# =========================
+# Audio Files
+# =========================
+*.mp3
+*.wav
+*.flac
+
+# =========================
+# Environment Variables
+# =========================
+.env
+.env.local
+.env.*
+*.env
+
+# =========================
+# System Files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Node / Frontend (If you add React later)
+# =========================
+node_modules/
+dist/
+build/
+
+# =========================
+# IDE Files
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Logs & Cache
+# =========================
+*.cache
+*.sqlite3
+
+# =========================
+# Temporary Files
+# =========================
+tmp/
+temp/
+temp_*
+temp_ws_*
+final_ws_*
+src/
