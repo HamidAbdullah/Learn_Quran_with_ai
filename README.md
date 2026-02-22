@@ -32,6 +32,7 @@ Recitation verification and Tajweed feedback API with a Tarteel-style web UI.
 - `POST /verify?surah=1&ayah=1` — Verify recitation (multipart audio file)
 - `WS /ws/verify?surah=1&ayah=1` — Live partial transcription (binary audio chunks)
 
-## Implementation plan
+## Documentation
 
-See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the full Tarteel-like roadmap (accuracy, real-time follow, model work).
+- **[Model, stability, accuracy, GPU/CPU & libraries](docs/MODEL_AND_SYSTEM.md)** — How the pipeline works, stability, accuracy, model sizes, and why each library is used.
+- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — Tarteel-like roadmap (accuracy, real-time follow, model work).

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quran AI — Recitation &amp; Tajweed</title>
+    <title>Quran With ai</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -245,6 +245,7 @@
         .legend-dot.wrong { background: var(--wrong); }
         .legend-dot.minor_mistake { background: var(--minor); }
         .legend-dot.missing { background: var(--missing); }
+        .legend-dot.extra { background: var(--accent); }
 
         /* —— Results: word-by-word —— */
         .results-section { display: none; }
@@ -268,6 +269,10 @@
         .verse-result .word.wrong { color: var(--wrong); }
         .verse-result .word.minor_mistake { color: var(--minor); }
         .verse-result .word.missing { color: var(--missing); text-decoration: line-through; }
+        .transcribed-line { font-size: 0.95rem; margin-bottom: 12px; color: var(--text-muted); }
+        .transcribed-line strong { color: var(--text); }
+        #transcribedText { color: var(--accent); font-family: var(--font-arabic); font-size: 1.1rem; }
+        .verse-result-label { font-size: 0.8rem; color: var(--text-muted); margin: 0 0 8px; }
 
         /* —— Stats —— */
         .stats {
@@ -309,6 +314,8 @@
         }
         .feedback-icon { font-size: 1.2rem; }
         .feedback-item span:last-child { flex: 1; }
+        .extra-words-wrap .extra-words-title { font-size: 0.9rem; font-weight: 600; color: var(--text-muted); margin: 0 0 6px; }
+        .extra-words-list { font-size: 1rem; color: var(--accent); margin: 0; }
 
         /* —— Loading overlay —— */
         .loading-overlay {
@@ -412,7 +419,12 @@
                     <span class="legend-item"><span class="legend-dot wrong"></span> Wrong</span>
                     <span class="legend-item"><span class="legend-dot minor_mistake"></span> Minor</span>
                     <span class="legend-item"><span class="legend-dot missing"></span> Missing</span>
+                    <span class="legend-item"><span class="legend-dot extra"></span> Extra</span>
                 </div>
+                <div class="transcribed-line" id="transcribedLine">
+                    <strong>What we heard:</strong> <span id="transcribedText" lang="ar" dir="rtl"></span>
+                </div>
+                <p class="verse-result-label">Verse — word-by-word result</p>
                 <div class="verse-result" id="verseResult"></div>
                 <div class="stats">
                     <div class="stat-box">
@@ -423,6 +435,10 @@
                         <div class="stat-val" id="tajweedScore">0%</div>
                         <div class="stat-label">Tajweed</div>
                     </div>
+                </div>
+                <div class="extra-words-wrap" id="extraWordsWrap" style="display:none; margin-bottom: 16px;">
+                    <h3 class="extra-words-title">Extra words (not in verse)</h3>
+                    <p class="extra-words-list" id="extraWordsList"></p>
                 </div>
                 <div class="teacher-section">
                     <h3>Teacher feedback</h3>
@@ -636,14 +652,24 @@
             function displayResults(data) {
                 resultsSection.classList.add('visible');
                 resultsSection.scrollIntoView({ behavior: 'smooth' });
+                document.getElementById('transcribedText').textContent = data.transcribed_text || '—';
                 verseResult.innerHTML = '';
                 (data.word_analysis || []).forEach(function (item) {
+                    if (!item.word && item.status === 'extra') return;
                     const span = document.createElement('span');
                     span.className = 'word ' + (item.status || '');
                     span.textContent = (item.word || '') + ' ';
                     span.title = (item.feedback || '') + ' (confidence ' + Math.round((item.confidence || 0) * 100) + '%)';
                     verseResult.appendChild(span);
                 });
+                var extraWrap = document.getElementById('extraWordsWrap');
+                var extraList = document.getElementById('extraWordsList');
+                if (data.extra_words && data.extra_words.length) {
+                    extraWrap.style.display = 'block';
+                    extraList.textContent = data.extra_words.join(' ');
+                } else {
+                    extraWrap.style.display = 'none';
+                }
                 accuracyScore.textContent = (data.accuracy_score != null ? data.accuracy_score : 0) + '%';
                 tajweedScore.textContent = (data.tajweed_score != null ? data.tajweed_score : 0) + '%';
                 teacherSummary.textContent = data.teacher_feedback_text || '';
