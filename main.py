@@ -28,20 +28,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load full Quran dataset
-QURAN_DATA_PATH = "quran_with_audio.json"
-try:
-    if os.path.exists(QURAN_DATA_PATH):
-        with open(QURAN_DATA_PATH, "r", encoding="utf-8") as f:
-            quran_dataset = json.load(f)
-            quran_map = {item["verse_key"]: item for item in quran_dataset}
-        print(f"Loaded {len(quran_dataset)} verses from {QURAN_DATA_PATH}")
-    else:
-        print(f"Warning: {QURAN_DATA_PATH} not found.")
-        quran_dataset = []
+def _load_quran():
+    """Load Quran data: list format (verse_key) or nested (surah -> ayah)."""
+    # Try flat list first (quran_with_audio.json)
+    path1 = "quran_with_audio.json"
+    if os.path.exists(path1):
+        with open(path1, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            quran_map = {item["verse_key"]: item for item in data}
+            return list(quran_map.values()), quran_map
+    # Fallback: nested quran.json
+    path2 = "quran.json"
+    if os.path.exists(path2):
+        with open(path2, "r", encoding="utf-8") as f:
+            nested = json.load(f)
+        dataset = []
         quran_map = {}
+        for surah_num, ayahs in nested.items():
+            for ayah_num, item in ayahs.items():
+                verse_key = f"{surah_num}:{ayah_num}"
+                entry = {"verse_key": verse_key, **item}
+                dataset.append(entry)
+                quran_map[verse_key] = entry
+        print(f"Loaded {len(dataset)} verses from {path2} (nested format)")
+        return dataset, quran_map
+    return [], {}
+
+try:
+    quran_dataset, quran_map = _load_quran()
+    if not quran_map:
+        print("Warning: No Quran data found. Add quran.json or quran_with_audio.json")
 except Exception as e:
-    print(f"Error loading quran dataset: {e}")
+    print(f"Error loading Quran: {e}")
     quran_dataset = []
     quran_map = {}
 
@@ -72,10 +91,26 @@ async def serve_demo():
 @app.get("/")
 def health_check():
     return {
-        "status": "ok", 
-        "message": "Quran AI Production API is running safely", 
-        "verses_loaded": len(quran_dataset)
+        "status": "ok",
+        "message": "Quran AI Production API is running safely",
+        "verses_loaded": len(quran_dataset),
     }
+
+
+@app.get("/verses/{surah}/{ayah}", response_model=None)
+def get_verse(surah: int, ayah: int):
+    """Get one verse by surah and ayah number (for UI verse preview)."""
+    verse_key = f"{surah}:{ayah}"
+    verse_data = quran_map.get(verse_key)
+    if not verse_data:
+        raise HTTPException(status_code=404, detail=f"Ayah {verse_key} not found")
+    return {
+        "verse_key": verse_key,
+        "text_uthmani": verse_data.get("text_uthmani", ""),
+        "translation_en": verse_data.get("translation_en", ""),
+        "transliteration": verse_data.get("transliteration", ""),
+    }
+
 
 @app.post("/verify")
 async def verify_recitation(
