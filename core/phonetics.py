@@ -8,7 +8,7 @@ import torch
 import librosa
 import numpy as np
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, Tuple
 
 MIN_AUDIO_DURATION = 0.5
 
@@ -93,6 +93,42 @@ class PhoneticAnalyzer:
         except Exception:
             return None
 
+    def run_forward(self, speech: np.ndarray, sr: int = 16000) -> Tuple[Optional[str], Optional[torch.Tensor]]:
+        """
+        Single forward pass: return (transcription, logits). Reuse logits for alignment and Tajweed.
+        Returns (None, None) if audio too short or on error.
+        """
+        try:
+            if len(speech) / sr < MIN_AUDIO_DURATION:
+                return None, None
+            input_values = self.processor(
+                speech, return_tensors="pt", sampling_rate=sr
+            ).input_values.to(self.device)
+            with torch.no_grad():
+                logits = self.model(input_values).logits
+            predicted_ids = torch.argmax(logits, dim=-1)[0]
+            transcription = self.processor.decode(predicted_ids)
+            return transcription, logits
+        except Exception:
+            return None, None
+
+    def analyze_alignment_from_logits(self, logits: torch.Tensor) -> Dict[str, Any]:
+        """Same structure as analyze_alignment but from precomputed logits (avoids extra forward pass)."""
+        out = {"transcription": "", "confidence_avg": 0.0, "frames": []}
+        try:
+            if logits is None or logits.dim() < 2:
+                return out
+            logits = logits.to(self.device)
+            predicted_ids = torch.argmax(logits, dim=-1)[0]
+            out["transcription"] = self.processor.decode(predicted_ids)
+            probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+            max_probs, _ = torch.max(probs, dim=-1)
+            out["confidence_avg"] = float(torch.mean(max_probs))
+            out["frames"] = max_probs.cpu().numpy().tolist()
+        except Exception:
+            pass
+        return out
+
     def analyze_alignment(self, audio_path: str, transcript: str) -> Dict[str, Any]:
         """Returns transcription + frame-level confidence for Tajweed. Safe defaults on error."""
         out = {"transcription": "", "confidence_avg": 0.0, "frames": []}
@@ -115,6 +151,34 @@ class PhoneticAnalyzer:
             pass
         return out
 
+    def get_phonetic_features_from_audio(self, y: np.ndarray, sr: int) -> Dict[str, Any]:
+        """Acoustic features from preloaded (y, sr). Avoids reloading the same file."""
+        default = {
+            "intensity": [],
+            "spectral_rolloff": [],
+            "duration": 0.0,
+            "sample_rate": 22050,
+            "frame_times": [],
+        }
+        try:
+            if len(y) == 0:
+                return default
+            duration = float(librosa.get_duration(y=y, sr=sr))
+            rms = librosa.feature.rms(y=y)[0]
+            rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
+            hop = 512
+            n_frames = rms.shape[0]
+            frame_times = (np.arange(n_frames) * hop / sr).tolist()
+            return {
+                "intensity": rms.tolist(),
+                "spectral_rolloff": rolloff.tolist(),
+                "duration": duration,
+                "sample_rate": sr,
+                "frame_times": frame_times,
+            }
+        except Exception:
+            return default
+
     def get_phonetic_features(self, audio_path: str) -> Dict[str, Any]:
         """
         Acoustic features for Tajweed: RMS intensity, spectral rolloff, duration.
@@ -129,24 +193,7 @@ class PhoneticAnalyzer:
         }
         try:
             y, sr = _load_audio(audio_path)
-            if len(y) == 0:
-                return default
-            duration = float(librosa.get_duration(y=y, sr=sr))
-            # RMS energy (intensity) — for Qalqalah burst, general loudness
-            rms = librosa.feature.rms(y=y)[0]
-            # Spectral rolloff — high-frequency content (e.g. for some consonant clarity)
-            rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
-            # Frame times for alignment with Wav2Vec2 frames if needed (hop_length 512 @ 22050 ≈ 23ms)
-            hop = 512
-            n_frames = rms.shape[0]
-            frame_times = (np.arange(n_frames) * hop / sr).tolist()
-            return {
-                "intensity": rms.tolist(),
-                "spectral_rolloff": rolloff.tolist(),
-                "duration": duration,
-                "sample_rate": sr,
-                "frame_times": frame_times,
-            }
+            return self.get_phonetic_features_from_audio(y, sr)
         except Exception:
             return default
 

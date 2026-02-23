@@ -112,7 +112,10 @@ inference_lock = threading.Lock()
 # Model selection from env
 _device = resolve_device() if callable(resolve_device) else "cpu"
 print("Loading Intelligence Engines...")
-whisper_model = whisper.load_model(os.environ.get("WHISPER_MODEL", WHISPER_MODEL))
+whisper_model = whisper.load_model(
+    os.environ.get("WHISPER_MODEL", WHISPER_MODEL),
+    device=_device,
+)
 phonetic_analyzer = PhoneticAnalyzer(
     model_name=os.environ.get("WAV2VEC2_MODEL", WAV2VEC2_MODEL),
     device=_device,
@@ -179,25 +182,32 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
         "tajweed_feedback": [],
         "timing_data": [],
     }
+    import librosa
+    import torch.nn.functional as F
+    y, sr = None, 16000
+    duration_sec = 0.0
     try:
-        # Short audio guard
-        import librosa
         y, sr = librosa.load(temp_filename, sr=16000, duration=300)
         duration_sec = len(y) / sr
         if duration_sec < 0.3:
             default_result["teacher_feedback_text"] = "Audio is too short. Please recite at least part of the verse."
             return default_result
     except Exception:
-        duration_sec = 0.0
+        pass
 
-    # Layer 1 — Dual ASR
+    # Layer 1 — Dual ASR (single Wav2Vec2 forward; reuse logits for alignment and Tajweed)
     whisper_text = ""
     try:
         trans = whisper_model.transcribe(temp_filename, language="ar")
         whisper_text = (trans.get("text") or "").strip()
     except Exception:
         pass
-    wav2vec_text = phonetic_analyzer.transcribe(temp_filename) or ""
+    wav2vec_text = ""
+    logits = None
+    if y is not None:
+        wav2vec_text, logits = phonetic_analyzer.run_forward(y, sr)
+    if not wav2vec_text:
+        wav2vec_text = phonetic_analyzer.transcribe(temp_filename) or ""
     if wav2vec_text and wav2vec_text.count(" ") < 2:
         wav2vec_text = segment_transcript_by_reference(wav2vec_text, original_text)
     if whisper_text and wav2vec_text:
@@ -207,30 +217,41 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
     else:
         transcribed_text = whisper_text or wav2vec_text
 
-    # Layer 2 — CTC forced alignment (word-level timing + confidence)
+    # Layer 2 — CTC forced alignment (reuse emission from single forward when available)
     alignment_words = []
     ref_words = [w for w in original_text.split() if normalize_arabic(w)]
     ref_norm = normalize_arabic(original_text)
+    emission = None
+    if logits is not None:
+        emission = F.log_softmax(logits, dim=-1)[0].cpu()
     try:
         align_result = align_reference_to_audio(
             processor=phonetic_analyzer.processor,
             model=phonetic_analyzer.model,
-            audio_path=temp_filename,
+            audio_path=temp_filename if emission is None else None,
             reference_text=ref_norm,
             reference_words=ref_words,
             device=phonetic_analyzer.device,
             load_audio_fn=load_audio_for_alignment,
+            emission=emission,
         )
         if align_result.get("alignment_success") and align_result.get("words"):
             alignment_words = align_result["words"]
     except Exception:
         pass
 
-    # Layer 3 — Tajweed
+    # Layer 3 — Tajweed (reuse logits and preloaded audio)
     tajweed_feedback = []
     try:
-        phonetic_results = phonetic_analyzer.analyze_alignment(temp_filename, original_text)
-        acoustic_features = phonetic_analyzer.get_phonetic_features(temp_filename)
+        if logits is not None:
+            phonetic_results = phonetic_analyzer.analyze_alignment_from_logits(logits)
+        else:
+            phonetic_results = phonetic_analyzer.analyze_alignment(temp_filename, original_text)
+        acoustic_features = (
+            phonetic_analyzer.get_phonetic_features_from_audio(y, sr)
+            if y is not None
+            else phonetic_analyzer.get_phonetic_features(temp_filename)
+        )
         if phonetic_results.get("frames") or acoustic_features.get("intensity"):
             tajweed_feedback = tajweed_engine.get_teacher_feedback(phonetic_results, acoustic_features)
     except Exception:
@@ -265,11 +286,12 @@ async def verify_recitation(
         with open(temp_filename, "wb") as buffer:
             shutil.copyfileobj(audio.file, buffer)
 
+        def _run_with_lock():
+            with inference_lock:
+                return _run_verification_pipeline(temp_filename, verse_key, original_text)
+
         loop = asyncio.get_event_loop()
-        final_result = await loop.run_in_executor(
-            None,
-            lambda: _run_verification_pipeline(temp_filename, verse_key, original_text),
-        )
+        final_result = await loop.run_in_executor(None, _run_with_lock)
         return final_result
     except asyncio.CancelledError:
         raise

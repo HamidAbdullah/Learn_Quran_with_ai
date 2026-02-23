@@ -180,25 +180,28 @@ def _segments_to_word_timings(
 def align_reference_to_audio(
     processor: Any,
     model: Any,
-    audio_path: str,
+    audio_path: Optional[str],
     reference_text: str,
     reference_words: List[str],
     device: str,
     load_audio_fn: Any,
     blank_id: int = 0,
+    emission: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     """
     Run CTC forced alignment: reference ayah text + user audio → word-level timings and confidence.
+    When emission is provided, skips loading audio and model forward (single forward pass).
 
     Args:
-        processor: Wav2Vec2Processor (for vocab and feature extraction).
-        model: Wav2Vec2ForCTC model.
-        audio_path: Path to audio file (16 kHz expected).
+        processor: Wav2Vec2Processor (for vocab).
+        model: Wav2Vec2ForCTC model (unused when emission is provided).
+        audio_path: Path to audio file (16 kHz); can be None when emission is provided.
         reference_text: Normalized reference verse text (with spaces).
         reference_words: List of reference words (for output structure).
         device: torch device.
         load_audio_fn: function(path, sr?) -> (waveform, sr).
         blank_id: CTC blank token id (usually 0).
+        emission: Optional precomputed log-probs (num_frames, vocab_size) on CPU; when set, no load/forward.
 
     Returns:
         {
@@ -213,18 +216,23 @@ def align_reference_to_audio(
         "alignment_success": False,
     }
     try:
-        speech, sr = load_audio_fn(audio_path, sr=16000)
-        if len(speech) / sr < 0.3:
-            return result
-        # Get emissions (log probs)
-        inputs = processor(
-            speech, return_tensors="pt", sampling_rate=16000, padding=True
-        )
-        input_values = inputs.input_values.to(device)
-        with torch.no_grad():
-            logits = model(input_values).logits
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        emission = log_probs[0].cpu()
+        if emission is not None:
+            # Reuse precomputed emission from single forward pass
+            emission = emission.cpu() if emission.device.type != "cpu" else emission
+        else:
+            if not audio_path or not load_audio_fn:
+                return result
+            speech, sr = load_audio_fn(audio_path, sr=16000)
+            if len(speech) / sr < 0.3:
+                return result
+            inputs = processor(
+                speech, return_tensors="pt", sampling_rate=16000, padding=True
+            )
+            input_values = inputs.input_values.to(device)
+            with torch.no_grad():
+                logits = model(input_values).logits
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            emission = log_probs[0].cpu()
         # Vocab: token -> id (Wav2Vec2CTCTokenizer has get_vocab or encoder)
         tok = processor.tokenizer
         vocab = getattr(tok, "get_vocab", None) and tok.get_vocab() or getattr(tok, "encoder", None) or {}
