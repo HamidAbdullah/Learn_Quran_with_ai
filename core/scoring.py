@@ -249,11 +249,16 @@ def score_recitation(
     tajweed_feedback: Optional[List[Dict[str, Any]]] = None,
     alignment_words: Optional[List[Dict[str, Any]]] = None,
     audio_duration: float = 0.0,
+    phoneme_accuracy: Optional[float] = None,
+    tajweed_rule_accuracy: Optional[float] = None,
+    tajweed_errors: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Tarteel-style multi-layer verification with optional time-alignment scoring.
     When alignment_words is provided, per-word score = 0.6*text + 0.3*phonetic + 0.1*timing.
     Returns word_analysis with status: correct | wrong | minor_mistake | missing | extra.
+    Phase 3: When phoneme_accuracy and tajweed_rule_accuracy are provided, adds
+    phoneme_aware_score = 0.5*word + 0.3*phoneme + 0.2*tajweed_rule. Backward compatible.
     """
     orig_norm = normalize_arabic(original_text)
     user_norm = normalize_arabic(user_text or "")
@@ -297,7 +302,7 @@ def score_recitation(
         for w in word_analysis
     ]
 
-    return {
+    result: Dict[str, Any] = {
         "transcribed_text": user_text,
         "accuracy_score": round(accuracy_score, 2),
         "word_analysis": word_analysis,
@@ -310,6 +315,18 @@ def score_recitation(
         "timing_data": timing_data,
     }
 
+    # Phase 3: phoneme-aware combined score when phoneme alignment data is provided
+    if phoneme_accuracy is not None and tajweed_rule_accuracy is not None:
+        word_acc = accuracy_score / 100.0
+        phoneme_aware = 0.5 * word_acc + 0.3 * phoneme_accuracy + 0.2 * tajweed_rule_accuracy
+        result["phoneme_accuracy"] = round(phoneme_accuracy, 4)
+        result["tajweed_rule_accuracy"] = round(tajweed_rule_accuracy, 4)
+        result["phoneme_aware_score"] = round(phoneme_aware * 100.0, 2)
+        if tajweed_errors is not None:
+            result["tajweed_errors"] = tajweed_errors
+
+    return result
+
 
 def count_matching_words(reference_text: str, transcript: str) -> int:
     """Return how many reference words have a matching word in the transcript (for choosing best ASR)."""
@@ -319,3 +336,17 @@ def count_matching_words(reference_text: str, transcript: str) -> int:
         return 0
     word_analysis, _, correct_count = _align_words(orig_norm, orig_norm, user_norm)
     return correct_count
+
+
+def get_lightweight_word_feedback(reference_text: str, partial_transcript: str) -> List[Dict[str, Any]]:
+    """
+    Lightweight word-level feedback for streaming: no alignment/timing, text-only.
+    Returns one entry per reference word: {"word": str, "status": "correct"|"wrong"|"minor_mistake"|"missing"|"pending"}.
+    Used by Phase 4 streaming layer for incremental feedback; does NOT run full tajweed/scoring.
+    """
+    orig_norm = normalize_arabic(reference_text or "").split()
+    user_norm = normalize_arabic(partial_transcript or "").split()
+    if not orig_norm:
+        return []
+    word_analysis, _, _ = _align_words(orig_norm, orig_norm, user_norm)
+    return [{"word": wa.get("word", ""), "status": wa.get("status", "pending")} for wa in word_analysis]
