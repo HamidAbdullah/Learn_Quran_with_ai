@@ -56,6 +56,8 @@ from core.normalization import normalize_arabic
 from core.scoring import score_recitation, segment_transcript_by_reference, count_matching_words
 from core.phonetics import PhoneticAnalyzer, load_audio_for_alignment
 from core.tajweed import TajweedRulesEngine
+from core.asr import run_dual_asr
+from core.metrics import wer, cer
 from alignment.ctc_alignment import align_reference_to_audio
 
 app = FastAPI(title="Quran AI Production API")
@@ -169,7 +171,12 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
     """
     3-layer verification: ASR → CTC alignment → Tajweed → scoring.
     Never raises; returns result with word_analysis and teacher_feedback always.
+    Adds timing_ms when available; falls back to current behavior on any failure.
     """
+    import time
+    _start = time.perf_counter()
+    timing_ms = {}
+
     default_result = {
         "transcribed_text": "",
         "accuracy_score": 0.0,
@@ -181,41 +188,48 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
         "teacher_feedback_text": "Could not complete verification. Please check audio length and try again.",
         "tajweed_feedback": [],
         "timing_data": [],
+        "asr_result": None,
+        "wer": None,
+        "cer": None,
     }
     import librosa
     import torch.nn.functional as F
     y, sr = None, 16000
     duration_sec = 0.0
     try:
+        t0 = time.perf_counter()
         y, sr = librosa.load(temp_filename, sr=16000, duration=300)
         duration_sec = len(y) / sr
+        timing_ms["load_audio"] = round((time.perf_counter() - t0) * 1000)
         if duration_sec < 0.3:
             default_result["teacher_feedback_text"] = "Audio is too short. Please recite at least part of the verse."
             return default_result
     except Exception:
         pass
 
-    # Layer 1 — Dual ASR (single Wav2Vec2 forward; reuse logits for alignment and Tajweed)
-    whisper_text = ""
+    # Layer 1 — Dual ASR (single entry point; reuse logits for alignment and Tajweed)
     try:
-        trans = whisper_model.transcribe(temp_filename, language="ar")
-        whisper_text = (trans.get("text") or "").strip()
+        t1 = time.perf_counter()
+        asr_result = run_dual_asr(
+            whisper_model=whisper_model,
+            phonetic_analyzer=phonetic_analyzer,
+            reference_text=original_text,
+            audio_path=temp_filename,
+            audio_y_sr=(y, sr) if y is not None else None,
+        )
+        timing_ms["asr"] = round((time.perf_counter() - t1) * 1000)
     except Exception:
-        pass
-    wav2vec_text = ""
-    logits = None
-    if y is not None:
-        wav2vec_text, logits = phonetic_analyzer.run_forward(y, sr)
-    if not wav2vec_text:
-        wav2vec_text = phonetic_analyzer.transcribe(temp_filename) or ""
-    if wav2vec_text and wav2vec_text.count(" ") < 2:
-        wav2vec_text = segment_transcript_by_reference(wav2vec_text, original_text)
-    if whisper_text and wav2vec_text:
-        w_match = count_matching_words(original_text, wav2vec_text)
-        wh_match = count_matching_words(original_text, whisper_text)
-        transcribed_text = wav2vec_text if w_match >= wh_match else whisper_text
-    else:
-        transcribed_text = whisper_text or wav2vec_text
+        asr_result = run_dual_asr(
+            whisper_model=whisper_model,
+            phonetic_analyzer=phonetic_analyzer,
+            reference_text=original_text,
+            audio_path=temp_filename,
+            audio_y_sr=(y, sr) if y is not None else None,
+        )
+    transcribed_text = asr_result["selected_transcript"]
+    logits = asr_result.get("logits")
+    # Strip logits from asr_result for JSON response (tensors not serializable)
+    asr_result_serializable = {k: v for k, v in asr_result.items() if k != "logits"}
 
     # Layer 2 — CTC forced alignment (reuse emission from single forward when available)
     alignment_words = []
@@ -225,6 +239,7 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
     if logits is not None:
         emission = F.log_softmax(logits, dim=-1)[0].cpu()
     try:
+        t2 = time.perf_counter()
         align_result = align_reference_to_audio(
             processor=phonetic_analyzer.processor,
             model=phonetic_analyzer.model,
@@ -235,6 +250,7 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
             load_audio_fn=load_audio_for_alignment,
             emission=emission,
         )
+        timing_ms["alignment"] = round((time.perf_counter() - t2) * 1000)
         if align_result.get("alignment_success") and align_result.get("words"):
             alignment_words = align_result["words"]
     except Exception:
@@ -243,6 +259,7 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
     # Layer 3 — Tajweed (reuse logits and preloaded audio)
     tajweed_feedback = []
     try:
+        t3 = time.perf_counter()
         if logits is not None:
             phonetic_results = phonetic_analyzer.analyze_alignment_from_logits(logits)
         else:
@@ -254,17 +271,59 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
         )
         if phonetic_results.get("frames") or acoustic_features.get("intensity"):
             tajweed_feedback = tajweed_engine.get_teacher_feedback(phonetic_results, acoustic_features)
+        timing_ms["tajweed"] = round((time.perf_counter() - t3) * 1000)
     except Exception:
         pass
 
     # Scoring with time-alignment when available
-    final_result = score_recitation(
-        original_text,
-        transcribed_text,
-        tajweed_feedback=tajweed_feedback,
-        alignment_words=alignment_words if alignment_words else None,
-        audio_duration=duration_sec,
-    )
+    phoneme_accuracy_arg = None
+    tajweed_rule_accuracy_arg = None
+    tajweed_errors_arg = None
+    try:
+        from core.phoneme import verse_to_phoneme_sequence
+        from alignment.phoneme_alignment import align_phoneme_sequences
+        from tajweed.rules import detect_tajweed_errors, tajweed_rule_accuracy as tajweed_rule_accuracy_fn
+        ref_phon = verse_to_phoneme_sequence(original_text)
+        hyp_phon = verse_to_phoneme_sequence(transcribed_text or "")
+        align_result = align_phoneme_sequences(
+            ref_phon["phoneme_sequence"],
+            hyp_phon["phoneme_sequence"],
+            word_boundaries=ref_phon.get("word_boundaries"),
+            reference_words=ref_phon.get("words"),
+        )
+        phoneme_accuracy_arg = align_result["phoneme_accuracy"]
+        tajweed_errors_arg = detect_tajweed_errors(align_result, reference_words=ref_phon.get("words"))
+        tajweed_rule_accuracy_arg = tajweed_rule_accuracy_fn(align_result)
+    except Exception:
+        pass
+
+    try:
+        t4 = time.perf_counter()
+        final_result = score_recitation(
+            original_text,
+            transcribed_text,
+            tajweed_feedback=tajweed_feedback,
+            alignment_words=alignment_words if alignment_words else None,
+            audio_duration=duration_sec,
+            phoneme_accuracy=phoneme_accuracy_arg,
+            tajweed_rule_accuracy=tajweed_rule_accuracy_arg,
+            tajweed_errors=tajweed_errors_arg,
+        )
+        timing_ms["scoring"] = round((time.perf_counter() - t4) * 1000)
+    except Exception:
+        final_result = score_recitation(
+            original_text,
+            transcribed_text,
+            tajweed_feedback=tajweed_feedback,
+            alignment_words=alignment_words if alignment_words else None,
+            audio_duration=duration_sec,
+        )
+    timing_ms["total"] = round((time.perf_counter() - _start) * 1000)
+    if timing_ms:
+        final_result["timing_ms"] = timing_ms
+    final_result["asr_result"] = asr_result_serializable
+    final_result["wer"] = round(wer(original_text, transcribed_text), 4) if transcribed_text else None
+    final_result["cer"] = round(cer(original_text, transcribed_text), 4) if transcribed_text else None
     return final_result
 
 
@@ -378,6 +437,72 @@ async def websocket_verify(websocket: WebSocket):
     except Exception as e:
         print(f"WS Error: {e}")
         traceback.print_exc()
+
+
+# ----- Phase 4: Streaming /ws/recite (new endpoint; does not replace /ws/verify or /verify) -----
+def _get_reference_text(verse_key: str) -> str:
+    return (quran_map.get(verse_key) or {}).get("text_uthmani", "")
+
+
+def _run_batch_verification_from_bytes(verse_key: str, reference_text: str, audio_bytes: bytes):
+    """Fail-safe: run full batch pipeline on buffered audio when streaming session ends."""
+    if not audio_bytes or len(audio_bytes) < 3200:
+        return {"error": "Audio too short for verification", "accuracy_score": 0.0}
+    from streaming.streaming_asr import _raw_to_wav
+    wav_bytes = _raw_to_wav(audio_bytes)
+    path = f"temp_ws_final_{verse_key.replace(':', '_')}_{uuid.uuid4().hex}.wav"
+    try:
+        with open(path, "wb") as f:
+            f.write(wav_bytes)
+        return _run_verification_pipeline(path, verse_key, reference_text)
+    finally:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
+try:
+    from streaming.websocket_server import build_ws_recite_handler
+    try:
+        _ws_window_ms = float(os.environ.get("WS_WINDOW_SECONDS", "2.5")) * 1000
+        _ws_overlap_ms = float(os.environ.get("WS_OVERLAP_SECONDS", "0.5")) * 1000
+        _ws_max_queue = int(os.environ.get("WS_MAX_QUEUE", "3"))
+    except Exception:
+        _ws_window_ms, _ws_overlap_ms, _ws_max_queue = 2500.0, 500.0, 3
+    try:
+        import metrics.streaming_metrics as _streaming_metrics
+        _get_adaptive_window_ms = lambda: _streaming_metrics.get_adaptive_window_seconds() * 1000
+        _metrics_module = _streaming_metrics
+    except ImportError:
+        _get_adaptive_window_ms = None
+        _metrics_module = None
+    _ws_recite_handler = build_ws_recite_handler(
+        get_whisper_model=lambda: whisper_model,
+        get_reference_text=lambda k: _get_reference_text(k),
+        get_inference_lock=lambda: inference_lock,
+        run_batch_verification=_run_batch_verification_from_bytes,
+        window_duration_ms=_ws_window_ms,
+        overlap_duration_ms=_ws_overlap_ms,
+        max_queue_depth=_ws_max_queue,
+        get_adaptive_window_ms=_get_adaptive_window_ms,
+        get_metrics=_metrics_module,
+    )
+    app.websocket("/ws/recite")(_ws_recite_handler)
+except ImportError as e:
+    print(f"Phase 4 streaming not registered: {e}")
+
+
+# ----- Phase 4.1: Observability GET /metrics/streaming (JSON snapshot) -----
+try:
+    from metrics.streaming_metrics import get_snapshot
+    @app.get("/metrics/streaming", include_in_schema=False)
+    def metrics_streaming():
+        """Return JSON snapshot of streaming metrics: active_connections, avg_latency_ms, p95_latency_ms, asr_failure_count, dropped_segments."""
+        return get_snapshot()
+except ImportError:
+    pass
 
 
 if __name__ == "__main__":

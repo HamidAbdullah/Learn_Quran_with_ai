@@ -34,7 +34,7 @@ def get_quran_path() -> str:
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 
 # Secondary: Wav2Vec2 Arabic (used for dual-ASR and CTC alignment)
-# Options: jonatasgrosman/wav2vec2-large-xlsr-53-arabic, rabah2026/wav2vec2-large-xlsr-53-arabic-quran-v2
+# Options: jonatasgrosman/wav2vec2-large-xlsr-53-arabic, rabah2026/wav2vec2-large-xlsr-53-arabic-quran-v2 (Quran-finetuned)
 WAV2VEC2_MODEL = os.environ.get(
     "WAV2VEC2_MODEL",
     "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
@@ -64,6 +64,8 @@ WS_PARTIAL_RESULT_INTERVAL = float(os.environ.get("WS_PARTIAL_RESULT_INTERVAL", 
 WS_CHUNK_THRESHOLD_BYTES = WS_BUFFER_THRESHOLD  # backward compat
 WS_WINDOW_SECONDS = float(os.environ.get("WS_WINDOW_SECONDS", "2.5"))
 WS_OVERLAP_SECONDS = float(os.environ.get("WS_OVERLAP_SECONDS", "0.5"))
+# Phase 4.1: max pending ASR segments per connection; if exceeded, send server_busy and skip chunk
+WS_MAX_QUEUE = int(os.environ.get("WS_MAX_QUEUE", "3"))
 
 # ----- CORS (production: set to specific origins) -----
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
