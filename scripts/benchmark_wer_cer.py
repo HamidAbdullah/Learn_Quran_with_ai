@@ -21,6 +21,10 @@ import argparse
 import json
 import os
 import sys
+import warnings
+
+# Suppress Whisper FP16-on-CPU warning (expected when not using GPU)
+warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
 
 # Add project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,6 +34,14 @@ from core.normalization import normalize_arabic
 
 
 def load_dataset(path: str, limit: int = None):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Dataset file not found: {path}\n"
+            "Use a real path to a JSON file, e.g.:\n"
+            "  dataset/training_dataset.json   (create via scripts/generate_training_dataset.py)\n"
+            "  quran_with_audio.json           (if you have it, with audio_file + text_uthmani)\n"
+            "Example: python scripts/benchmark_wer_cer.py dataset/training_dataset.json --run-asr --limit 20 -o report.json"
+        )
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
@@ -52,18 +64,41 @@ def get_hypothesis(item: dict) -> str:
 
 
 def run_asr_for_item(audio_path: str, reference: str):
-    """Run dual ASR and return selected transcript. Requires app context (whisper_model, phonetic_analyzer)."""
+    """Run dual ASR (beam search, Quran Wav2Vec2, Whisper small). Loads audio once to WAV so we decode MP3 only once and can skip bad files."""
+    import tempfile
     try:
-        import main as app
-        from core.asr import run_dual_asr
-        asr_result = run_dual_asr(
-            whisper_model=app.whisper_model,
-            phonetic_analyzer=app.phonetic_analyzer,
-            reference_text=reference,
-            audio_path=audio_path,
-            audio_y_sr=None,
-        )
-        return asr_result["selected_transcript"]
+        import librosa
+        import soundfile as sf
+        # Decode audio once (if MP3 is malformed we fail here and skip; avoids decoding twice)
+        try:
+            y, sr = librosa.load(audio_path, sr=16000)
+        except Exception:
+            print(f"  [skip] Could not load audio: {audio_path}", file=sys.stderr)
+            return ""
+        if y is None or len(y) == 0:
+            return ""
+        # Temp WAV so both Whisper and Wav2Vec2 use the same decoded audio (no second MP3 read)
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        try:
+            os.close(fd)
+            sf.write(wav_path, y, sr)
+            import main as app
+            from core.asr import run_dual_asr
+            whisper_beam_size = getattr(app, "WHISPER_BEAM_SIZE", 5)
+            asr_result = run_dual_asr(
+                whisper_model=app.whisper_model,
+                phonetic_analyzer=app.phonetic_analyzer,
+                reference_text=reference,
+                audio_path=wav_path,
+                audio_y_sr=(y, sr),
+                whisper_beam_size=whisper_beam_size,
+            )
+            return asr_result["selected_transcript"]
+        finally:
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
     except Exception as e:
         print(f"ASR error for {audio_path}: {e}", file=sys.stderr)
         return ""
@@ -86,13 +121,14 @@ def main():
     parser.add_argument("--run-asr", action="store_true", help="Run ASR for each item (requires models)")
     parser.add_argument("--audio-base-dir", default=None, help="Base directory for relative audio paths")
     parser.add_argument("--limit", type=int, default=None, help="Max number of items to process")
+    parser.add_argument("--output", "-o", default=None, help="Write report JSON to file")
     parser.add_argument("--self-test", action="store_true", help="Use reference as hypothesis (expect 0 WER/CER)")
     args = parser.parse_args()
 
     base_dir = args.audio_base_dir or os.environ.get("AUDIO_BASE_DIR", "")
     items = load_dataset(args.dataset, args.limit)
 
-    wers, cers = [], []
+    indexed = []  # (verse_key, wer, cer)
     for i, item in enumerate(items):
         ref = get_reference(item)
         if not ref:
@@ -108,19 +144,45 @@ def main():
             continue
         w = wer(ref, hyp)
         c = cer(ref, hyp)
-        wers.append(w)
-        cers.append(c)
         key = item.get("verse_key") or item.get("audio") or str(i)
+        indexed.append((key, w, c))
         print(f"  {key}: WER={w:.4f} CER={c:.4f}")
 
-    if not wers:
+    if not indexed:
         print("No items with reference and hypothesis. Add 'hypothesis' to JSON or use --run-asr with valid audio paths.")
         return 1
-    avg_wer = sum(wers) / len(wers)
-    avg_cer = sum(cers) / len(cers)
-    print(f"\nProcessed {len(wers)} items.")
+    n = len(indexed)
+    avg_wer = sum(x[1] for x in indexed) / n
+    avg_cer = sum(x[2] for x in indexed) / n
+    worst_10 = sorted(indexed, key=lambda x: -x[1])[:10]
+    best_10 = sorted(indexed, key=lambda x: x[1])[:10]
+
+    print(f"\n{'='*60}")
+    print("ASR BENCHMARK REPORT (Quran high-accuracy mode)")
+    print(f"{'='*60}")
+    print(f"Processed: {n} items")
     print(f"Average WER: {avg_wer:.4f}")
     print(f"Average CER: {avg_cer:.4f}")
+    print(f"\n--- Worst 10 verses (by WER) ---")
+    for sid, w, c in worst_10:
+        print(f"  {sid}: WER={w:.4f} CER={c:.4f}")
+    print(f"\n--- Best 10 verses (by WER) ---")
+    for sid, w, c in best_10:
+        print(f"  {sid}: WER={w:.4f} CER={c:.4f}")
+    print(f"{'='*60}\n")
+
+    if args.output:
+        report = {
+            "n_samples": n,
+            "avg_wer": round(avg_wer, 4),
+            "avg_cer": round(avg_cer, 4),
+            "worst_10_by_wer": [{"verse_key": s, "wer": round(w, 4), "cer": round(c, 4)} for s, w, c in worst_10],
+            "best_10_by_wer": [{"verse_key": s, "wer": round(w, 4), "cer": round(c, 4)} for s, w, c in best_10],
+        }
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"Report written to {args.output}")
+
     return 0
 
 

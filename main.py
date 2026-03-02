@@ -9,6 +9,10 @@ import warnings
 
 warnings.filterwarnings("ignore", message=".*urllib3 v2 only supports OpenSSL.*", category=UserWarning)
 warnings.filterwarnings("ignore", module="urllib3")
+warnings.filterwarnings("ignore", message=".*PySoundFile failed.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*audioread.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*__audioread_load.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*FP16 is not supported on CPU.*", category=UserWarning)
 
 import json
 import whisper
@@ -34,23 +38,33 @@ try:
     HOST = _config.HOST
     WHISPER_MODEL = _config.WHISPER_MODEL
     WAV2VEC2_MODEL = _config.WAV2VEC2_MODEL
+    ASR_USE_WHISPER = getattr(_config, "ASR_USE_WHISPER", True)
     WAV2VEC2_QUANTIZE_8BIT = _config.WAV2VEC2_QUANTIZE_8BIT
     TORCH_COMPILE = _config.TORCH_COMPILE
+    BEAM_WIDTH = getattr(_config, "BEAM_WIDTH", 1)
+    WHISPER_BEAM_SIZE = getattr(_config, "WHISPER_BEAM_SIZE", 1)
     WS_CHUNK_THRESHOLD_BYTES = _config.WS_CHUNK_THRESHOLD_BYTES
     WS_BUFFER_THRESHOLD = _config.WS_BUFFER_THRESHOLD
     WS_PARTIAL_RESULT_INTERVAL = _config.WS_PARTIAL_RESULT_INTERVAL
+    VERIFY_TIMEOUT_SEC = getattr(_config, "VERIFY_TIMEOUT_SEC", 10)
+    VERIFY_MAX_AUDIO_DURATION_SEC = getattr(_config, "VERIFY_MAX_AUDIO_DURATION_SEC", 30)
 except ImportError:
     get_quran_path = lambda: ""
     get_cors_origins = lambda: ["*"]
     resolve_device = lambda: ("cuda" if __import__("torch").cuda.is_available() else "cpu")
     PORT, HOST = 8001, "0.0.0.0"
     WHISPER_MODEL = "base"
-    WAV2VEC2_MODEL = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
+    WAV2VEC2_MODEL = "rabah2026/wav2vec2-large-xlsr-53-arabic-quran-v2"
+    ASR_USE_WHISPER = False
     WAV2VEC2_QUANTIZE_8BIT = False
     TORCH_COMPILE = False
+    BEAM_WIDTH = 1
+    WHISPER_BEAM_SIZE = 1
     WS_CHUNK_THRESHOLD_BYTES = 150000
     WS_BUFFER_THRESHOLD = 150000
     WS_PARTIAL_RESULT_INTERVAL = 2.5
+    VERIFY_TIMEOUT_SEC = 10.0
+    VERIFY_MAX_AUDIO_DURATION_SEC = 30.0
 
 from core.normalization import normalize_arabic
 from core.scoring import score_recitation, segment_transcript_by_reference, count_matching_words
@@ -111,21 +125,25 @@ except Exception as e:
 
 inference_lock = threading.Lock()
 
-# Model selection from env
+# Model selection from env (Whisper only loaded when ASR_USE_WHISPER=true for 2–3s target)
 _device = resolve_device() if callable(resolve_device) else "cpu"
 print("Loading Intelligence Engines...")
-whisper_model = whisper.load_model(
-    os.environ.get("WHISPER_MODEL", WHISPER_MODEL),
-    device=_device,
-)
+whisper_model = None
+if ASR_USE_WHISPER:
+    whisper_model = whisper.load_model(
+        os.environ.get("WHISPER_MODEL", WHISPER_MODEL),
+        device=_device,
+    )
+    print("Whisper loaded (dual-ASR mode).")
 phonetic_analyzer = PhoneticAnalyzer(
     model_name=os.environ.get("WAV2VEC2_MODEL", WAV2VEC2_MODEL),
     device=_device,
     quantize_8bit=WAV2VEC2_QUANTIZE_8BIT,
     use_torch_compile=TORCH_COMPILE,
+    beam_width=BEAM_WIDTH,
 )
 tajweed_engine = TajweedRulesEngine()
-print("All Engines Loaded.")
+print("All Engines Loaded." + (" (Wav2Vec2-only: target 2–3s)" if not ASR_USE_WHISPER else ""))
 
 os.makedirs("static", exist_ok=True)
 app.mount("/demo-static", StaticFiles(directory="static"), name="static")
@@ -198,16 +216,22 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
     duration_sec = 0.0
     try:
         t0 = time.perf_counter()
-        y, sr = librosa.load(temp_filename, sr=16000, duration=300)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            warnings.simplefilter("ignore", FutureWarning)
+            # Cap duration so pipeline stays ~2–3s (config: VERIFY_MAX_AUDIO_DURATION_SEC)
+            y, sr = librosa.load(temp_filename, sr=16000, duration=VERIFY_MAX_AUDIO_DURATION_SEC)
         duration_sec = len(y) / sr
         timing_ms["load_audio"] = round((time.perf_counter() - t0) * 1000)
         if duration_sec < 0.3:
+            print(f"[Verify] verse_key={verse_key} skipped: audio too short ({round(duration_sec, 2)}s)")
             default_result["teacher_feedback_text"] = "Audio is too short. Please recite at least part of the verse."
             return default_result
     except Exception:
         pass
 
     # Layer 1 — Dual ASR (single entry point; reuse logits for alignment and Tajweed)
+    asr_result = None
     try:
         t1 = time.perf_counter()
         asr_result = run_dual_asr(
@@ -216,16 +240,25 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
             reference_text=original_text,
             audio_path=temp_filename,
             audio_y_sr=(y, sr) if y is not None else None,
+            whisper_beam_size=WHISPER_BEAM_SIZE,
+            use_whisper=ASR_USE_WHISPER,
         )
         timing_ms["asr"] = round((time.perf_counter() - t1) * 1000)
-    except Exception:
-        asr_result = run_dual_asr(
-            whisper_model=whisper_model,
-            phonetic_analyzer=phonetic_analyzer,
-            reference_text=original_text,
-            audio_path=temp_filename,
-            audio_y_sr=(y, sr) if y is not None else None,
-        )
+    except Exception as e:
+        print(f"ASR error: {e}")
+        asr_result = {
+            "selected_transcript": "",
+            "selected_source": "wav2vec",
+            "selection_reason": "error",
+            "logits": None,
+        }
+    if asr_result is None:
+        asr_result = {
+            "selected_transcript": "",
+            "selected_source": "wav2vec",
+            "selection_reason": "error",
+            "logits": None,
+        }
     transcribed_text = asr_result["selected_transcript"]
     logits = asr_result.get("logits")
     # Strip logits from asr_result for JSON response (tensors not serializable)
@@ -256,44 +289,35 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
     except Exception:
         pass
 
-    # Layer 3 — Tajweed (reuse logits and preloaded audio)
+    # Layer 3 — Tajweed light only: Madd, Qalqalah, Ghunnah (segment-level CTC when alignment available)
     tajweed_feedback = []
     try:
         t3 = time.perf_counter()
-        if logits is not None:
-            phonetic_results = phonetic_analyzer.analyze_alignment_from_logits(logits)
-        else:
-            phonetic_results = phonetic_analyzer.analyze_alignment(temp_filename, original_text)
-        acoustic_features = (
-            phonetic_analyzer.get_phonetic_features_from_audio(y, sr)
-            if y is not None
-            else phonetic_analyzer.get_phonetic_features(temp_filename)
-        )
-        if phonetic_results.get("frames") or acoustic_features.get("intensity"):
-            tajweed_feedback = tajweed_engine.get_teacher_feedback(phonetic_results, acoustic_features)
+        if y is not None and len(y) > 0:
+            if alignment_words:
+                frames_per_word = None
+                if logits is not None:
+                    phonetic_results = phonetic_analyzer.analyze_alignment_from_logits(logits)
+                    frames = phonetic_results.get("frames") or []
+                    if frames and alignment_words:
+                        import numpy as np
+                        n_frames, n_words = len(frames), len(alignment_words)
+                        frames_per_word = []
+                        for i in range(n_words):
+                            s = alignment_words[i].get("start_time") or 0.0
+                            e = alignment_words[i].get("end_time") or s + 0.1
+                            f_start = int(s * 50)
+                            f_end = min(int(e * 50), n_frames)
+                            frames_per_word.append(frames[f_start:f_end] if f_end > f_start else [])
+                fb, _ = tajweed_engine.get_teacher_feedback_segment_level(
+                    alignment_words, y, sr, frames_per_word=frames_per_word
+                )
+                tajweed_feedback = fb
+            else:
+                # Single segment = full audio for light rules only
+                fake_alignment = [{"start_time": 0.0, "end_time": duration_sec}]
+                tajweed_feedback = tajweed_engine.get_teacher_feedback_light(fake_alignment, y, sr)
         timing_ms["tajweed"] = round((time.perf_counter() - t3) * 1000)
-    except Exception:
-        pass
-
-    # Scoring with time-alignment when available
-    phoneme_accuracy_arg = None
-    tajweed_rule_accuracy_arg = None
-    tajweed_errors_arg = None
-    try:
-        from core.phoneme import verse_to_phoneme_sequence
-        from alignment.phoneme_alignment import align_phoneme_sequences
-        from tajweed.rules import detect_tajweed_errors, tajweed_rule_accuracy as tajweed_rule_accuracy_fn
-        ref_phon = verse_to_phoneme_sequence(original_text)
-        hyp_phon = verse_to_phoneme_sequence(transcribed_text or "")
-        align_result = align_phoneme_sequences(
-            ref_phon["phoneme_sequence"],
-            hyp_phon["phoneme_sequence"],
-            word_boundaries=ref_phon.get("word_boundaries"),
-            reference_words=ref_phon.get("words"),
-        )
-        phoneme_accuracy_arg = align_result["phoneme_accuracy"]
-        tajweed_errors_arg = detect_tajweed_errors(align_result, reference_words=ref_phon.get("words"))
-        tajweed_rule_accuracy_arg = tajweed_rule_accuracy_fn(align_result)
     except Exception:
         pass
 
@@ -305,9 +329,6 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
             tajweed_feedback=tajweed_feedback,
             alignment_words=alignment_words if alignment_words else None,
             audio_duration=duration_sec,
-            phoneme_accuracy=phoneme_accuracy_arg,
-            tajweed_rule_accuracy=tajweed_rule_accuracy_arg,
-            tajweed_errors=tajweed_errors_arg,
         )
         timing_ms["scoring"] = round((time.perf_counter() - t4) * 1000)
     except Exception:
@@ -321,6 +342,9 @@ def _run_verification_pipeline(temp_filename: str, verse_key: str, original_text
     timing_ms["total"] = round((time.perf_counter() - _start) * 1000)
     if timing_ms:
         final_result["timing_ms"] = timing_ms
+        # Log pipeline timing for observability
+        parts = [f"{k}={v}ms" for k, v in timing_ms.items()]
+        print(f"[Verify] verse_key={verse_key} audio_sec={round(duration_sec, 1)}s " + " ".join(parts))
     final_result["asr_result"] = asr_result_serializable
     final_result["wer"] = round(wer(original_text, transcribed_text), 4) if transcribed_text else None
     final_result["cer"] = round(cer(original_text, transcribed_text), 4) if transcribed_text else None
@@ -350,9 +374,18 @@ async def verify_recitation(
                 return _run_verification_pipeline(temp_filename, verse_key, original_text)
 
         loop = asyncio.get_event_loop()
-        final_result = await loop.run_in_executor(None, _run_with_lock)
+        executor_task = loop.run_in_executor(None, _run_with_lock)
+        try:
+            final_result = await asyncio.wait_for(executor_task, timeout=VERIFY_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Verification timed out after {VERIFY_TIMEOUT_SEC}s. Try a shorter recording.",
+            )
         return final_result
     except asyncio.CancelledError:
+        raise
+    except HTTPException:
         raise
     except Exception as e:
         print(f"Verify Error: {e}")

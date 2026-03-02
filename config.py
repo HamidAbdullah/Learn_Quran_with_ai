@@ -28,17 +28,21 @@ def get_quran_path() -> str:
             return str(p)
     return ""
 
-# ----- ASR models -----
-# Primary: whisper size (tiny, base, small, medium, large, large-v2, large-v3)
-# Or path to a Quran fine-tuned Whisper if available
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
+# ----- ASR models (target 2–3s verify: Wav2Vec2-only; set ASR_USE_WHISPER=true for dual) -----
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # base = fast; small/medium = slower, more accurate
 
-# Secondary: Wav2Vec2 Arabic (used for dual-ASR and CTC alignment)
-# Options: jonatasgrosman/wav2vec2-large-xlsr-53-arabic, rabah2026/wav2vec2-large-xlsr-53-arabic-quran-v2 (Quran-finetuned)
+# Wav2Vec2: MUST be Quran-finetuned (no generic Arabic)
 WAV2VEC2_MODEL = os.environ.get(
     "WAV2VEC2_MODEL",
-    "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
+    "rabah2026/wav2vec2-large-xlsr-53-arabic-quran-v2",
 )
+
+# false = Wav2Vec2 only (~2–3s); true = Whisper + Wav2Vec2 (slower, best WER)
+ASR_USE_WHISPER = os.environ.get("ASR_USE_WHISPER", "false").lower() in ("1", "true", "yes")
+
+# ----- ASR decoding (1 = greedy, 2–3s; 5–10 = slower, better accuracy) -----
+BEAM_WIDTH = int(os.environ.get("BEAM_WIDTH", "1"))  # 1 = greedy decode for 2–3s target
+WHISPER_BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))  # 1 = greedy when Whisper used
 
 # ----- Device & optimization -----
 # auto | cuda | cpu
@@ -66,6 +70,11 @@ WS_WINDOW_SECONDS = float(os.environ.get("WS_WINDOW_SECONDS", "2.5"))
 WS_OVERLAP_SECONDS = float(os.environ.get("WS_OVERLAP_SECONDS", "0.5"))
 # Phase 4.1: max pending ASR segments per connection; if exceeded, send server_busy and skip chunk
 WS_MAX_QUEUE = int(os.environ.get("WS_MAX_QUEUE", "3"))
+
+# ----- Verify endpoint (target 2–3s response) -----
+VERIFY_TIMEOUT_SEC = float(os.environ.get("VERIFY_TIMEOUT_SEC", "10"))
+# Max audio seconds to process; lower = faster (30s keeps pipeline ~2–3s)
+VERIFY_MAX_AUDIO_DURATION_SEC = float(os.environ.get("VERIFY_MAX_AUDIO_DURATION_SEC", "30"))
 
 # ----- CORS (production: set to specific origins) -----
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
