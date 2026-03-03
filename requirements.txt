@@ -13,3 +13,7 @@ python-dotenv>=1.0.0
 
 # Testing
 pytest>=7.0.0
+
+# Optional: Diacritization (Seerat AI mode). Uncomment one:
+# camel-tools  # CAMeL Tools
+# transformers already above; for AraT5 use: UBC-NLP/AraT5-base-diacritization

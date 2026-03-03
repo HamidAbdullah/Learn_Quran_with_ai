@@ -1,19 +1,24 @@
 """
 Arabic-optimized ASR (Wav2Vec2) for Quran recitation.
-Supports Quran-finetuned models, optional 8-bit quantization, and phoneme energy analysis for Tajweed.
+Supports Quran-finetuned models, beam search decoding (production), optional 8-bit quantization.
+Single forward pass; emissions reused for alignment (no duplicate forward).
 """
+import logging
 import os
 import warnings
 import torch
 import librosa
 import numpy as np
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-from typing import Dict, Any, Optional, Callable, Tuple
+from typing import Dict, Any, Optional, Callable, Tuple, List
 
 MIN_AUDIO_DURATION = 0.5
+SAMPLING_RATE = 16000
 
-# Default: strong Arabic ASR. Quran-finetuned: rabah2026/wav2vec2-large-xlsr-53-arabic-quran-v2
-DEFAULT_ASR_MODEL = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
+# Production default: Quran-finetuned model only
+DEFAULT_ASR_MODEL = "rabah2026/wav2vec2-large-xlsr-53-arabic-quran-v2"
+
+logger = logging.getLogger(__name__)
 
 
 def _load_audio(path: str, sr: Optional[int] = None):
@@ -31,10 +36,72 @@ def load_audio_for_alignment(path: str, sr: int = 16000):
     return _load_audio(path, sr=sr)
 
 
+def _ctc_beam_search_decode(
+    log_probs: torch.Tensor,
+    processor: Any,
+    vocab_size: int,
+    blank_id: int = 0,
+    beam_width: int = 50,
+) -> str:
+    """
+    CTC prefix beam search. Decode log_probs (T, V) to best transcript.
+    Replaces greedy argmax for lower WER in production. Uses processor.decode for correct output.
+    """
+    if beam_width <= 1 or log_probs.size(0) == 0:
+        return ""
+    T, V = log_probs.size(0), log_probs.size(1)
+    V = min(V, vocab_size)
+    log_probs = log_probs.cpu().numpy()
+    beams = [((), blank_id, 0.0)]
+    for t in range(T):
+        lp_t = log_probs[t]
+        next_beams: Dict[tuple, float] = {}
+        for (ids, last, log_p) in beams:
+            key_blank = (ids, last)
+            next_beams[key_blank] = max(next_beams.get(key_blank, -1e9), log_p + float(lp_t[blank_id]))
+            for v in range(V):
+                if v == blank_id:
+                    continue
+                lp_v = float(lp_t[v])
+                if v == last:
+                    key = (ids, v)
+                else:
+                    key = (ids + (v,), v)
+                next_beams[key] = max(next_beams.get(key, -1e9), log_p + lp_v)
+        sorted_beams = sorted(next_beams.items(), key=lambda x: -x[1])[: beam_width]
+        beams = [(k[0], k[1], p) for k, p in sorted_beams]
+    if not beams:
+        return ""
+    best_ids, _, _ = max(beams, key=lambda x: x[2])
+    if not best_ids:
+        return ""
+    collapsed: List[int] = []
+    for i in best_ids:
+        if i == blank_id:
+            continue
+        if not collapsed or collapsed[-1] != i:
+            collapsed.append(i)
+    if not collapsed:
+        return ""
+    return processor.decode(collapsed).strip()
+
+
+def _get_decoder_vocab(processor: Any) -> Tuple[int, int]:
+    """Return (blank_id, vocab_size) from Wav2Vec2 processor for CTC beam search."""
+    vocab = getattr(processor.tokenizer, "get_vocab", None)
+    if vocab is None:
+        vocab = getattr(processor.tokenizer, "encoder", None) or {}
+    if callable(vocab):
+        vocab = vocab()
+    blank_id = getattr(processor.tokenizer, "pad_token_id", None) or 0
+    vocab_size = len(vocab)
+    return blank_id, vocab_size
+
+
 class PhoneticAnalyzer:
     """
-    Arabic-optimized ASR (Wav2Vec2 XLSR) for Quran recitation.
-    Used for dual-ASR (secondary) and CTC alignment; supports quantization and torch.compile.
+    Arabic-optimized ASR (Wav2Vec2) for Quran recitation.
+    Production: beam search decoding, 16 kHz, emissions reused for alignment (no duplicate forward).
     """
 
     def __init__(
@@ -43,6 +110,7 @@ class PhoneticAnalyzer:
         device: Optional[str] = None,
         quantize_8bit: bool = False,
         use_torch_compile: bool = False,
+        beam_width: Optional[int] = None,
     ):
         self.model_name = (
             model_name
@@ -59,9 +127,16 @@ class PhoneticAnalyzer:
         self.use_torch_compile = use_torch_compile or (
             os.environ.get("TORCH_COMPILE", "").lower() in ("1", "true", "yes")
         )
-        print(f"Initializing PhoneticAnalyzer ({self.model_name}) on {self.device} (8bit={self.quantize_8bit}, compile={self.use_torch_compile})...")
+        self.beam_width = beam_width if beam_width is not None else int(os.environ.get("BEAM_WIDTH", "50"))
+        print(
+            f"Initializing PhoneticAnalyzer ({self.model_name}) on {self.device} "
+            f"(8bit={self.quantize_8bit}, compile={self.use_torch_compile}, beam_width={self.beam_width})..."
+        )
         self.processor = Wav2Vec2Processor.from_pretrained(self.model_name)
         self.model = Wav2Vec2ForCTC.from_pretrained(self.model_name, use_safetensors=True)
+        self._blank_id, self._vocab_size = _get_decoder_vocab(self.processor)
+        if self.beam_width > 1:
+            logger.info("Wav2Vec2 decoding: beam_search beam_width=%d (production accuracy mode)", self.beam_width)
         if self.quantize_8bit:
             try:
                 self.model = torch.quantization.quantize_dynamic(
@@ -78,24 +153,30 @@ class PhoneticAnalyzer:
                 pass
 
     def transcribe(self, audio_path: str) -> Optional[str]:
-        """Transcribe audio to Arabic text. Returns None if too short or on error."""
+        """Transcribe audio to Arabic text (16 kHz). Beam search when beam_width > 1. Returns None if too short or on error."""
         try:
-            speech, sr = _load_audio(audio_path, sr=16000)
+            speech, sr = _load_audio(audio_path, sr=SAMPLING_RATE)
             if len(speech) / sr < MIN_AUDIO_DURATION:
                 return None
             input_values = self.processor(
-                speech, return_tensors="pt", sampling_rate=16000
+                speech, return_tensors="pt", sampling_rate=SAMPLING_RATE
             ).input_values.to(self.device)
             with torch.no_grad():
                 logits = self.model(input_values).logits
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)[0]
+            if self.beam_width > 1:
+                return _ctc_beam_search_decode(
+                    log_probs, self.processor, self._vocab_size, self._blank_id, self.beam_width
+                )
             predicted_ids = torch.argmax(logits, dim=-1)[0]
             return self.processor.decode(predicted_ids)
         except Exception:
             return None
 
-    def run_forward(self, speech: np.ndarray, sr: int = 16000) -> Tuple[Optional[str], Optional[torch.Tensor]]:
+    def run_forward(self, speech: np.ndarray, sr: int = SAMPLING_RATE) -> Tuple[Optional[str], Optional[torch.Tensor]]:
         """
         Single forward pass: return (transcription, logits). Reuse logits for alignment and Tajweed.
+        Decoding: beam search when beam_width > 1 (production). Sampling rate must be 16 kHz for Wav2Vec2.
         Returns (None, None) if audio too short or on error.
         """
         try:
@@ -106,21 +187,33 @@ class PhoneticAnalyzer:
             ).input_values.to(self.device)
             with torch.no_grad():
                 logits = self.model(input_values).logits
-            predicted_ids = torch.argmax(logits, dim=-1)[0]
-            transcription = self.processor.decode(predicted_ids)
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)[0]
+            if self.beam_width > 1:
+                transcription = _ctc_beam_search_decode(
+                    log_probs, self.processor, self._vocab_size, self._blank_id, self.beam_width
+                )
+            else:
+                predicted_ids = torch.argmax(logits, dim=-1)[0]
+                transcription = self.processor.decode(predicted_ids)
             return transcription, logits
         except Exception:
             return None, None
 
     def analyze_alignment_from_logits(self, logits: torch.Tensor) -> Dict[str, Any]:
-        """Same structure as analyze_alignment but from precomputed logits (avoids extra forward pass)."""
+        """Same structure as analyze_alignment but from precomputed logits (avoids extra forward pass). Uses same decoding as run_forward (beam when beam_width > 1)."""
         out = {"transcription": "", "confidence_avg": 0.0, "frames": []}
         try:
             if logits is None or logits.dim() < 2:
                 return out
             logits = logits.to(self.device)
-            predicted_ids = torch.argmax(logits, dim=-1)[0]
-            out["transcription"] = self.processor.decode(predicted_ids)
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)[0]
+            if self.beam_width > 1:
+                out["transcription"] = _ctc_beam_search_decode(
+                    log_probs, self.processor, self._vocab_size, self._blank_id, self.beam_width
+                )
+            else:
+                predicted_ids = torch.argmax(logits, dim=-1)[0]
+                out["transcription"] = self.processor.decode(predicted_ids)
             probs = torch.nn.functional.softmax(logits, dim=-1)[0]
             max_probs, _ = torch.max(probs, dim=-1)
             out["confidence_avg"] = float(torch.mean(max_probs))
@@ -130,19 +223,25 @@ class PhoneticAnalyzer:
         return out
 
     def analyze_alignment(self, audio_path: str, transcript: str) -> Dict[str, Any]:
-        """Returns transcription + frame-level confidence for Tajweed. Safe defaults on error."""
+        """Returns transcription + frame-level confidence for Tajweed. Uses beam decode when beam_width > 1."""
         out = {"transcription": "", "confidence_avg": 0.0, "frames": []}
         try:
-            speech, sr = _load_audio(audio_path, sr=16000)
+            speech, sr = _load_audio(audio_path, sr=SAMPLING_RATE)
             if len(speech) / sr < MIN_AUDIO_DURATION:
                 return out
             input_values = self.processor(
-                speech, return_tensors="pt", sampling_rate=16000
+                speech, return_tensors="pt", sampling_rate=SAMPLING_RATE
             ).input_values.to(self.device)
             with torch.no_grad():
                 logits = self.model(input_values).logits
-            predicted_ids = torch.argmax(logits, dim=-1)[0]
-            out["transcription"] = self.processor.decode(predicted_ids)
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)[0]
+            if self.beam_width > 1:
+                out["transcription"] = _ctc_beam_search_decode(
+                    log_probs, self.processor, self._vocab_size, self._blank_id, self.beam_width
+                )
+            else:
+                predicted_ids = torch.argmax(logits, dim=-1)[0]
+                out["transcription"] = self.processor.decode(predicted_ids)
             probs = torch.nn.functional.softmax(logits, dim=-1)[0]
             max_probs, _ = torch.max(probs, dim=-1)
             out["confidence_avg"] = float(torch.mean(max_probs))

@@ -1,10 +1,13 @@
 """
 Tajweed verification engine using acoustic + phonetic signals.
-Qalqalah (intensity gradient), Madd (vowel duration), Ghunnah (nasal band), Idgham (transition).
-Falls back to heuristic rules when phonetic detection is weak.
+Research-level: segment-level analysis only (CTC word alignment windows).
+Never analyze Tajweed on full audio globally.
 """
+import logging
 import numpy as np
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Nasal frequency band for Ghunnah (approx 200–400 Hz and formant region)
 GHUNNAH_LOW_HZ = 150
@@ -71,7 +74,8 @@ class TajweedRulesEngine:
         self, acoustic_features: Dict[str, Any], level: int = 2
     ) -> Dict[str, Any]:
         """
-        Madd: vowel duration. Uses overall duration vs expected; heuristic when no per-vowel timing.
+        Madd: vowel duration per CTC segment. Uses segment duration only (no global stats).
+        Very short segment (< 0.05s) scores lower; normal range 0.05–2.0s scores high.
         """
         duration = acoustic_features.get("duration") or 0.0
         if duration <= 0:
@@ -80,8 +84,18 @@ class TajweedRulesEngine:
                 "score": 0.85,
                 "feedback": "Madd duration could not be measured; aim for 2–6 counts as required.",
             }
-        # Heuristic: assume verse has some long vowels; duration should be reasonable
-        # (Fallback: no reference duration here, so we return moderate score and feedback)
+        if duration < 0.05:
+            return {
+                "rule": f"Madd ({level} Harakat)",
+                "score": 0.82,
+                "feedback": "Segment too short for Madd; hold long vowels 2–6 counts.",
+            }
+        if duration > 3.0:
+            return {
+                "rule": f"Madd ({level} Harakat)",
+                "score": 0.88,
+                "feedback": "Madd duration is long; keep 2–6 counts as per the rule.",
+            }
         return {
             "rule": f"Madd ({level} Harakat)",
             "score": 0.92,
@@ -212,3 +226,73 @@ class TajweedRulesEngine:
         feedback_list.append(self.analyze_meem_sakina(intensity))
 
         return feedback_list
+
+    def get_teacher_feedback_light(
+        self,
+        alignment_words: List[Dict[str, Any]],
+        y: np.ndarray,
+        sr: int,
+        frames_per_word: Optional[List[List[float]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Light Tajweed only: Madd duration, Qalqalah burst, basic Ghunnah.
+        Uses segment-level CTC alignment windows + existing acoustic features. No heavy ML.
+        """
+        try:
+            import librosa
+        except ImportError:
+            return []
+
+        if not alignment_words or y is None or len(y) == 0:
+            return []
+
+        segment_scores: Dict[str, List[float]] = {"Madd": [], "Qalqalah": [], "Ghunnah": []}
+        for i, w in enumerate(alignment_words):
+            start = w.get("start_time") or 0.0
+            end = w.get("end_time") or 0.0
+            if end <= start or (end - start) < 0.02:
+                continue
+            start_sample = int(start * sr)
+            end_sample = min(int(end * sr), len(y))
+            if end_sample <= start_sample:
+                continue
+            segment = y[start_sample:end_sample]
+            rms = librosa.feature.rms(y=segment)[0]
+            rolloff = librosa.feature.spectral_rolloff(y=segment, sr=sr)[0]
+            intensity = rms.tolist()
+            spectral = rolloff.tolist()
+            frames_seg = (frames_per_word[i] if frames_per_word and i < len(frames_per_word) else None) or []
+
+            m = self.analyze_madd({"duration": end - start, "intensity": intensity, "spectral_rolloff": spectral}, level=2)
+            segment_scores["Madd"].append(m.get("score", 0.5))
+            q = self.analyze_qalqalah(intensity)
+            segment_scores["Qalqalah"].append(q.get("score", 0.5))
+            g = self.analyze_ghunnah(intensity, frames_seg, spectral)
+            segment_scores["Ghunnah"].append(g.get("score", 0.5))
+
+        feedback_list = []
+        m_def = self.analyze_madd({"duration": 0}, level=2)
+        q_def = self.analyze_qalqalah([])
+        g_def = self.analyze_ghunnah([])
+        for rule_name, scores in segment_scores.items():
+            avg = float(np.mean(scores)) if scores else 0.75
+            if rule_name == "Madd":
+                feedback_list.append({"rule": rule_name, "score": round(avg, 2), "feedback": m_def.get("feedback", "Madd duration.")})
+            elif rule_name == "Qalqalah":
+                feedback_list.append({"rule": rule_name, "score": round(avg, 2), "feedback": q_def.get("feedback", "Qalqalah burst.")})
+            else:
+                feedback_list.append({"rule": rule_name, "score": round(avg, 2), "feedback": g_def.get("feedback", "Ghunnah nasal.")})
+        return feedback_list
+
+    def get_teacher_feedback_segment_level(
+        self,
+        alignment_words: List[Dict[str, Any]],
+        y: np.ndarray,
+        sr: int,
+        frames_per_word: Optional[List[List[float]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Segment-level Tajweed (CTC word windows). Light mode: Madd, Qalqalah, Ghunnah only.
+        """
+        feedback_list = self.get_teacher_feedback_light(alignment_words, y, sr, frames_per_word)
+        return feedback_list, ""

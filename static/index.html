@@ -241,11 +241,14 @@
             height: 10px;
             border-radius: 50%;
         }
+        .legend-dot.green { background: var(--correct); }
+        .legend-dot.yellow { background: var(--minor); }
+        .legend-dot.red { background: var(--wrong); }
+        .legend-dot.grey { background: var(--missing); }
         .legend-dot.correct { background: var(--correct); }
         .legend-dot.wrong { background: var(--wrong); }
         .legend-dot.minor_mistake { background: var(--minor); }
         .legend-dot.missing { background: var(--missing); }
-        .legend-dot.extra { background: var(--accent); }
 
         /* —— Results: word-by-word —— */
         .results-section { display: none; }
@@ -265,6 +268,10 @@
             border-radius: 6px;
             transition: background 0.2s;
         }
+        .verse-result .word.green { color: var(--correct); }
+        .verse-result .word.yellow { color: var(--minor); }
+        .verse-result .word.red { color: var(--wrong); }
+        .verse-result .word.grey { color: var(--missing); }
         .verse-result .word.correct { color: var(--correct); }
         .verse-result .word.wrong { color: var(--wrong); }
         .verse-result .word.minor_mistake { color: var(--minor); }
@@ -414,12 +421,11 @@
         <section class="results-section" id="resultsSection">
             <div class="card">
                 <div class="card-title">Result</div>
-                <div class="legend" aria-label="Mistake types">
-                    <span class="legend-item"><span class="legend-dot correct"></span> Correct</span>
-                    <span class="legend-item"><span class="legend-dot wrong"></span> Wrong</span>
-                    <span class="legend-item"><span class="legend-dot minor_mistake"></span> Minor</span>
-                    <span class="legend-item"><span class="legend-dot missing"></span> Missing</span>
-                    <span class="legend-item"><span class="legend-dot extra"></span> Extra</span>
+                <div class="legend" aria-label="Word status">
+                    <span class="legend-item"><span class="legend-dot green"></span> Correct (≥92%)</span>
+                    <span class="legend-item"><span class="legend-dot yellow"></span> Medium (78–92%)</span>
+                    <span class="legend-item"><span class="legend-dot red"></span> Wrong (&lt;78%)</span>
+                    <span class="legend-item"><span class="legend-dot grey"></span> Skipped</span>
                 </div>
                 <div class="transcribed-line" id="transcribedLine">
                     <strong>What we heard:</strong> <span id="transcribedText" lang="ar" dir="rtl"></span>
@@ -657,7 +663,7 @@
                 (data.word_analysis || []).forEach(function (item) {
                     if (!item.word && item.status === 'extra') return;
                     const span = document.createElement('span');
-                    span.className = 'word ' + (item.status || '');
+                    span.className = 'word ' + (item.color || item.status || '');
                     span.textContent = (item.word || '') + ' ';
                     span.title = (item.feedback || '') + ' (confidence ' + Math.round((item.confidence || 0) * 100) + '%)';
                     verseResult.appendChild(span);

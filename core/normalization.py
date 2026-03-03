@@ -15,6 +15,8 @@ def normalize_arabic(text: Optional[str], strip_diacritics: bool = True) -> str:
 
     # Remove Tatweel (ـ)
     text = re.sub(r'\u0640', '', text)
+    # Lam-Alif presentation forms → لا (for consistent matching with ASR/output)
+    text = re.sub(r'[\uFEFB\uFEFC]', 'لا', text)
 
     if strip_diacritics:
         # Diacritics and Quranic marks (harakat, sukun, shadda, etc.)

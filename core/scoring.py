@@ -14,14 +14,21 @@ from rapidfuzz import fuzz
 from .normalization import normalize_arabic
 from typing import Dict, Any, List, Optional, Tuple
 
-# Tarteel-like thresholds
-SIMILARITY_CORRECT = 0.92   # >= 92% → correct
-SIMILARITY_MINOR = 0.78     # 78–92% → minor_mistake; < 78% → wrong
+# UI color thresholds (WER/CER + normalized Arabic matching)
+SIMILARITY_CORRECT = 0.92   # >= 92% → GREEN (correct)
+SIMILARITY_MINOR = 0.78     # 78–92% → YELLOW (medium); < 78% → RED (wrong); missing → GREY
 
-# Combined score weights (when alignment is available)
-WEIGHT_TEXT = 0.6
-WEIGHT_PHONETIC = 0.3
-WEIGHT_TIMING = 0.1
+
+def _status_to_color(status: str) -> str:
+    """Map word status to UI color only: green, yellow, red, grey."""
+    if status == "correct":
+        return "green"
+    if status == "minor_mistake":
+        return "yellow"
+    if status == "wrong":
+        return "red"
+    return "grey"  # missing / skipped
+
 
 def _word_similarity(ref_word: str, user_word: str) -> float:
     """Strict similarity for scoring: ratio is primary; partial_ratio only slight boost for 1-char ASR slips."""
@@ -62,11 +69,40 @@ def segment_transcript_by_reference(raw_transcript: str, reference_text: str) ->
             if sim > best_sim:
                 best_sim = sim
                 best_len = L
+            if sim >= 0.99:
+                break  # Prefer exact match; avoid over-consuming remaining
         segments.append(remaining[:best_len])
         remaining = remaining[best_len:]
     if remaining:
         segments.append(remaining)
     return " ".join(segments)
+
+
+def _timing_consistency(alignment_words: List[Dict[str, Any]]) -> float:
+    """
+    Rhythm/timing consistency from word durations (0–1). Used in research scoring.
+    High when word durations are reasonably consistent; low when very irregular.
+    """
+    if not alignment_words or len(alignment_words) < 2:
+        return 0.85
+    durations = []
+    for w in alignment_words:
+        s = w.get("start_time") or 0.0
+        e = w.get("end_time") or 0.0
+        if e > s:
+            durations.append(e - s)
+    if len(durations) < 2:
+        return 0.85
+    import math
+    mean_d = sum(durations) / len(durations)
+    var_d = sum((d - mean_d) ** 2 for d in durations) / len(durations)
+    std_d = math.sqrt(var_d) if var_d > 0 else 0.0
+    if mean_d <= 0:
+        return 0.85
+    # Coefficient of variation; map to 0–1 (low cv = high consistency)
+    cv = std_d / mean_d if mean_d else 1.0
+    consistency = max(0.0, min(1.0, 1.0 - cv * 2.0))  # rough mapping
+    return round(consistency, 4)
 
 
 def _timing_similarity(
@@ -99,6 +135,17 @@ def _timing_similarity(
     return 1.0
 
 
+def _status_to_color(status: str) -> str:
+    """Map word status to UI color only: green, yellow, red, grey."""
+    if status == "correct":
+        return "green"
+    if status == "minor_mistake":
+        return "yellow"
+    if status == "wrong":
+        return "red"
+    return "grey"  # missing / skipped
+
+
 def _align_words(
     orig_norm: List[str],
     orig_display: List[str],
@@ -107,8 +154,9 @@ def _align_words(
     audio_duration: float = 0.0,
 ) -> Tuple[List[Dict[str, Any]], List[str], int]:
     """
-    Align reference words to user words. When alignment exists: 0.6*text + 0.3*phonetic + 0.1*timing.
-    When alignment does NOT exist: timing_weight = 0.0. Returns (word_analysis, extra_user_words, correct_count).
+    Align reference words to user words. Word status from normalized Arabic text similarity only:
+    >= 92% correct (green), 78–92% minor_mistake (yellow), < 78% wrong (red), missing → grey.
+    Returns (word_analysis with status + color, extra_user_words, correct_count).
     """
     matcher = SequenceMatcher(None, orig_norm, user_norm)
     word_analysis: List[Dict[str, Any]] = []
@@ -116,9 +164,10 @@ def _align_words(
     correct_count = 0
     use_alignment = alignment_words and len(alignment_words) >= len(orig_display)
 
-    def _status_from_combined(text_sim: float, phonetic_sim: float, timing_sim: float) -> str:
+    def _status_from_similarity(text_sim: float, phonetic_sim: float, timing_sim: float) -> str:
+        # Use text similarity only for UI color (WER/CER used at verse level)
         if use_alignment:
-            combined = WEIGHT_TEXT * text_sim + WEIGHT_PHONETIC * phonetic_sim + WEIGHT_TIMING * timing_sim
+            combined = 0.6 * text_sim + 0.3 * phonetic_sim + 0.1 * timing_sim
             if combined >= SIMILARITY_CORRECT:
                 return "correct"
             if combined >= SIMILARITY_MINOR:
@@ -147,17 +196,16 @@ def _align_words(
                     timing_sim = _timing_similarity(i, alignment_words, audio_duration)
                 else:
                     timing_sim = 0.0  # timing_weight = 0 when no alignment
-                status = _status_from_combined(text_sim, phonetic_sim, timing_sim)
+                status = _status_from_similarity(text_sim, phonetic_sim, timing_sim)
                 if status == "correct":
                     correct_count += 1
                 combined_conf = (
-                    WEIGHT_TEXT * text_sim + WEIGHT_PHONETIC * phonetic_sim + (WEIGHT_TIMING * timing_sim if use_alignment else 0.0)
-                )
-                if not use_alignment:
-                    combined_conf = text_sim  # text-only
+                    0.6 * text_sim + 0.3 * phonetic_sim + (0.1 * timing_sim if use_alignment else 0.0)
+                ) if use_alignment else text_sim
                 entry = {
                     "word": orig_display[i],
                     "status": status,
+                    "color": _status_to_color(status),
                     "confidence": combined_conf,
                     "feedback": _feedback_from_status(status),
                 }
@@ -195,17 +243,16 @@ def _align_words(
                     if use_alignment and global_idx < len(alignment_words):
                         phonetic_sim = float(alignment_words[global_idx].get("confidence") or alignment_words[global_idx].get("phonetic_similarity") or 0.5)
                     timing_sim = _timing_similarity(global_idx, alignment_words or [], audio_duration)
-                    status = _status_from_combined(text_sim, phonetic_sim, timing_sim)
+                    status = _status_from_similarity(text_sim, phonetic_sim, timing_sim)
                     if status == "correct":
                         correct_count += 1
                     combined = (
-                        WEIGHT_TEXT * text_sim + WEIGHT_PHONETIC * phonetic_sim + (WEIGHT_TIMING * timing_sim if use_alignment else 0.0)
-                    )
-                    if not use_alignment:
-                        combined = text_sim
+                        0.6 * text_sim + 0.3 * phonetic_sim + (0.1 * timing_sim if use_alignment else 0.0)
+                    ) if use_alignment else text_sim
                     entry = {
                         "word": o_disp,
                         "status": status,
+                        "color": _status_to_color(status),
                         "confidence": combined,
                         "feedback": _feedback_from_status(status),
                     }
@@ -220,6 +267,7 @@ def _align_words(
                     word_analysis.append({
                         "word": o_disp,
                         "status": "missing",
+                        "color": "grey",
                         "confidence": 0.0,
                         "feedback": "Word omitted.",
                     })
@@ -232,6 +280,7 @@ def _align_words(
                 word_analysis.append({
                     "word": orig_display[i],
                     "status": "missing",
+                    "color": "grey",
                     "confidence": 0.0,
                     "feedback": "Word omitted.",
                 })
@@ -249,11 +298,12 @@ def score_recitation(
     tajweed_feedback: Optional[List[Dict[str, Any]]] = None,
     alignment_words: Optional[List[Dict[str, Any]]] = None,
     audio_duration: float = 0.0,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
-    Tarteel-style multi-layer verification with optional time-alignment scoring.
-    When alignment_words is provided, per-word score = 0.6*text + 0.3*phonetic + 0.1*timing.
-    Returns word_analysis with status: correct | wrong | minor_mistake | missing | extra.
+    Recitation scoring for UI: word-level status + color (green/yellow/red/grey).
+    Accuracy from word matching; uses WER/CER at verse level (computed in main).
+    No complex scoring formula. When user does not recite, all words are grey.
     """
     orig_norm = normalize_arabic(original_text)
     user_norm = normalize_arabic(user_text or "")
@@ -264,6 +314,58 @@ def score_recitation(
     orig_display_words = [w for w in original_text.split() if normalize_arabic(w)]
     if len(orig_display_words) != len(orig_words):
         orig_display_words = orig_words
+
+    # If user recites a completely different ayah, we want the UI to show
+    # all reference words as "missing" (grey) instead of "wrong" (red).
+    # Detect this via very low global similarity between normalized texts.
+    is_completely_different = False
+    if orig_words and user_words:
+        # 0–1 similarity on full verse; < 0.35 ≈ different verse in practice.
+        global_sim = fuzz.ratio(orig_norm, user_norm) / 100.0
+        if global_sim < 0.35:
+            is_completely_different = True
+
+    if is_completely_different:
+        # Mark every reference word as missing (grey); treat all user words as extra.
+        word_analysis = [
+            {
+                "word": w,
+                "status": "missing",
+                "color": "grey",
+                "confidence": 0.0,
+                "feedback": "Word omitted.",
+            }
+            for w in orig_display_words
+        ]
+        extra_words = user_words[:]  # everything user said is outside the verse
+        accuracy_score = 0.0
+
+        tajweed_score = 100.0
+        if tajweed_feedback:
+            tajweed_score = (
+                sum(item.get("score", 0) for item in tajweed_feedback) / len(tajweed_feedback) * 100
+            )
+
+        confidence_level = "low"
+        teacher_feedback = "You recited a different ayah. Please recite the selected verse."
+
+        timing_data = [
+            {"word": w["word"], "start_time": w.get("start_time"), "end_time": w.get("end_time")}
+            for w in word_analysis
+        ]
+
+        return {
+            "transcribed_text": user_text,
+            "accuracy_score": round(accuracy_score, 2),
+            "word_analysis": word_analysis,
+            "extra_words": extra_words,
+            "tajweed_score": round(tajweed_score, 2),
+            "confidence_level": confidence_level,
+            "confidence_score": round(accuracy_score, 2),
+            "teacher_feedback_text": teacher_feedback,
+            "tajweed_feedback": tajweed_feedback or [],
+            "timing_data": timing_data,
+        }
 
     word_analysis, extra_words, correct_count = _align_words(
         orig_words,
@@ -279,19 +381,18 @@ def score_recitation(
     if tajweed_feedback:
         tajweed_score = sum(item.get("score", 0) for item in tajweed_feedback) / len(tajweed_feedback) * 100
 
-    combined_score = (accuracy_score * 0.7) + (tajweed_score * 0.3)
-    confidence_score = round(combined_score, 2)  # 0–100 numeric
-    if combined_score >= 95:
+    if accuracy_score >= 92:
         confidence_level = "high"
-        teacher_feedback = "Excellent recitation! Your pronunciation and Tajweed are near perfect."
-    elif combined_score >= 80:
+        teacher_feedback = "Correct recitation."
+    elif accuracy_score >= 78:
         confidence_level = "medium"
-        teacher_feedback = "Good effort. Focus a bit more on the highlighted words and rules."
+        teacher_feedback = "Medium accuracy. Review highlighted words."
     else:
         confidence_level = "low"
-        teacher_feedback = "Please review the correct pronunciation and Tajweed rules for this verse."
+        teacher_feedback = "Wrong recitation. Please try again."
+    if not user_text or not user_norm.strip():
+        teacher_feedback = "No recitation detected. Please recite the ayah."
 
-    # timing_data: word-level start/end for UI (from alignment or word_analysis)
     timing_data = [
         {"word": w["word"], "start_time": w.get("start_time"), "end_time": w.get("end_time")}
         for w in word_analysis
@@ -304,7 +405,7 @@ def score_recitation(
         "extra_words": extra_words,
         "tajweed_score": round(tajweed_score, 2),
         "confidence_level": confidence_level,
-        "confidence_score": confidence_score,
+        "confidence_score": round(accuracy_score, 2),
         "teacher_feedback_text": teacher_feedback,
         "tajweed_feedback": tajweed_feedback or [],
         "timing_data": timing_data,
@@ -319,3 +420,17 @@ def count_matching_words(reference_text: str, transcript: str) -> int:
         return 0
     word_analysis, _, correct_count = _align_words(orig_norm, orig_norm, user_norm)
     return correct_count
+
+
+def get_lightweight_word_feedback(reference_text: str, partial_transcript: str) -> List[Dict[str, Any]]:
+    """
+    Lightweight word-level feedback for streaming: no alignment/timing, text-only.
+    Returns one entry per reference word: {"word": str, "status": "correct"|"wrong"|"minor_mistake"|"missing"|"pending"}.
+    Used by Phase 4 streaming layer for incremental feedback; does NOT run full tajweed/scoring.
+    """
+    orig_norm = normalize_arabic(reference_text or "").split()
+    user_norm = normalize_arabic(partial_transcript or "").split()
+    if not orig_norm:
+        return []
+    word_analysis, _, _ = _align_words(orig_norm, orig_norm, user_norm)
+    return [{"word": wa.get("word", ""), "status": wa.get("status", "pending"), "color": wa.get("color", "grey")} for wa in word_analysis]
